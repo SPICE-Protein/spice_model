@@ -1,0 +1,85 @@
+# SPICE Post-train (RL) configuration -- dual-path: path A (SAC micro) + path B (ES macro)
+env:
+  relax_iters: 200            # Engine.build relaxation iterations
+  tolerance: 2.0              # energy minimization tolerance (kcal/mol)
+  pressure: 1.0               # bar
+  ionic_default: 0.0          # M
+  episode_max_steps: 200      # max MD steps per episode
+  force_dim: 16               # bias-force basis dimension M (matches engine ForceAction)
+  force_clamp: 0.5            # kcal/(mol·Å)
+  mutation_every: 20          # temporally layered actions: mutation every 20 steps
+  env_offset_dim: 2           # [ΔpH, ΔT]
+  u_window: 10                # potential-energy history window (Critic privileged input)
+  metric_dim: 5               # M = [m1..m5]
+  ph_min: 0.0
+  ph_max: 14.0
+  temp_min: 150.0
+  temp_max: 400.0
+  reward_scale: 1.0           # 1.0 = strict -U_t (kJ/mol)
+
+sac:
+  gamma: 0.99
+  tau: 0.005
+  lr_actor: 3.0e-4
+  lr_critic: 3.0e-4
+  lr_alpha: 3.0e-4
+  target_entropy_factor: 0.5      # target entropy = -dim * 0.5
+  buffer_capacity: 1000000        # global Replay Buffer (watch memory)
+  batch_size: 512
+  update_every_steps: 500         # async collection: update every 500 steps
+  hidden_dim: 256
+  # mixed action (design customization 2)
+  enable_mutation_head: true
+  discrete_position_dim: 256      # mutation-position one-hot dim (= longest sequence)
+  aa_dim: 20
+  gumbel_tau: 1.0
+  # temporally layered actions (design customization 5)
+  track_mutation_mask: true
+  mutation_every: 20
+
+es:
+  population: 32              # candidate mutants per batch
+  elites: 8
+  generations: 50
+  mutation_rate: 0.1
+  crossover_rate: 0.5
+  n_mutations_per_candidate: [1, 3]   # 1-3 point mutations per candidate
+  head_b_noise: 0.05
+  head_c_noise: 0.05
+  freeze_backbone: true
+  fitness_survive_steps: 200  # survival beyond this counts as stable
+
+post:
+  max_episodes: 1000
+  path_a_threads: 2           # path A dual-thread perturbation (+Δ / -Δ)
+  env_delta_ph: 0.5
+  env_delta_T: 5.0
+  anchor_ph: 7.0              # starting environment (wild-type default)
+  anchor_temp: 298.0
+  # stage 2: quick check (MD sprint checks physical validity)
+  quick_check_steps: 20
+  # path A: stability phase map (stable region / crash boundary)
+  phase_map_dir: runs/posttrain/phase_maps
+  phase_map_interval: 50      # scan every N episodes (0=off)
+  phase_map_temp_range: [250.0, 350.0, 10.0]
+  phase_map_ph_range: [2.0, 11.0, 1.0]
+  # stage 4: pseudo-label feedback
+  pseudo_label_dir: data/pseudo_labels
+  pseudo_tfrecord_path: data/pseudo_labels/pseudo.tfrecord
+  pseudo_weight_repeat: 8     # confidence-weight repetition factor
+  pretrain_tfrecord_dir: data/tfrecords
+  # finetuning
+  finetune_epochs: 1
+  finetune_batch_size: 16
+  finetune_lr: 1.0e-4
+  finetune_out: checkpoints/pretrain/finetuned.weights.h5
+  # Head D: dual-path confidence supervision (label = survival steps / max steps)
+  conf_lr: 1.0e-4
+  conf_batch: 256
+  conf_train_interval: 10     # train every N episodes (0=off)
+  log_dir: runs/posttrain
+  ckpt_dir: checkpoints/posttrain
+  log_every: 10
+  ckpt_every: 100
+  pretrain_ckpt: checkpoints/pretrain/best_weights.weights.h5
+  pretrain_config: configs/pretrain.yaml

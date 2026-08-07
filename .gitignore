@@ -1,0 +1,45 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.so
+*.o
+.pytest_cache
+
+# --- Virtual env ---
+.venv/
+venv/
+env/
+
+# --- Data / artifacts ---
+data/raw/
+data/cache/
+data/parquet/
+data/tfrecords/
+data/pseudo_labels/
+*.tfrecord
+*.npz
+*.parquet
+*.h5
+*.weights.h5
+
+# --- Training outputs ---
+checkpoints/
+runs/
+tensorboard/
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Logs / temp ---
+*.log
+/tmp/

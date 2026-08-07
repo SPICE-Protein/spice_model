@@ -1,0 +1,11 @@
+# SPICE Pre-train 依赖
+# 国内建议：pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+tensorflow>=2.16
+datasets>=3.0
+huggingface_hub>=0.23
+pyarrow>=15.0
+polars>=0.20
+pyyaml>=6.0
+tensorboard>=2.16   # 可选：训练曲线可视化（缺失时自动降级）
+tqdm>=4.66           # 可选：训练进度条（缺失时自动降级为逐步打印）
+pytest>=7.0          # 开发：单元测试 (tests/)
