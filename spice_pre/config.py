@@ -69,7 +69,7 @@ class TrainConfig:
     max_steps: int = 0     # 0 = 按 epochs 跑满
     cache_train: bool = True        # True = 把整个 epoch 的 batch 预存内存，管线不再拖累计算
     dist_weight: float = 1.0        # binned distogram CE 权重（主目标）
-    pair_weight: float = 0.3        # 坐标两两距离 RMSE 辅助权重（略小，给坐标头兜底）
+    pair_weight: float = 0.05       # 坐标两两距离 RMSE 辅助权重（0.3→0.05：坐标头噪声梯度干扰 CE 主导，已下调）
     use_gpu: bool = True            # True = 用 GPU（若有）；False = 强制只用 CPU
     gpu_mem_growth: bool = True     # 显存按需增长（避免一次性占满）
     gpu_devices: str = ""          # GPU 编号白名单，如 "0" / "0,1"；空 = 全部

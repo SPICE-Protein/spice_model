@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from contextlib import nullcontext
 
 import numpy as np
 import tensorflow as tf
@@ -82,8 +83,13 @@ class _WarmupCosineSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
         }
 
 
-def build_lr_schedule(cfg: Config):
-    total = cfg.train.max_steps or 1_000_000
+def build_lr_schedule(cfg: Config, total_steps: int | None = None):
+    """LR 余弦退火按真实训练步数衰减。
+
+    之前 total 默认 1e6，而实际只跑 ~2 万步 → cosine 退化成常数 1e-3，
+    全程不退火，模型在盆地边缘震荡不收敛。传入真实 total_steps 修复。
+    """
+    total = total_steps or cfg.train.max_steps or 1_000_000
     return _WarmupCosineSchedule(cfg.train.lr, cfg.train.warmup_steps, total)
 
 
@@ -99,8 +105,17 @@ def _bucket_length_fn(x, y=None):
     return tf.shape(x["tokens"])[0]
 
 
-def _make_padded_dataset(cfg: Config, split: str):
+def _make_padded_dataset(cfg: Config, split: str, batch_size: int | None = None):
+    """按 split 构建数据管线。batch_size 缺省用 cfg.train.batch_size
+    （多卡 MirroredStrategy 时传 per-replica batch）。"""
+    bs = batch_size or cfg.train.batch_size
     ds = load_tfrecord_dataset(cfg, split=split)
+    # 过滤含非有限值（NaN/Inf）的样本：脏坐标或脏 env 都会把 loss 污染成 NaN。
+    # ⚠️ 之前只查 coords、漏了 env——env 走 AdaLN 逐层注入，一个 NaN 就能毒掉整批。
+    ds = ds.filter(lambda x, y: (
+        tf.reduce_all(tf.math.is_finite(x["coords"])) &
+        tf.reduce_all(tf.math.is_finite(x["env"]))
+    ))
     padded_shapes = (
         {"tokens": [None], "mask": [None], "env": [3], "coords": [None, 3]},
         [None, 3],
@@ -120,11 +135,19 @@ def _make_padded_dataset(cfg: Config, split: str):
             cfg.data.max_seq_len + 1
         ]
         n_buckets = len(boundaries) + 1
-        batch_sizes = [cfg.train.batch_size] * n_buckets
-        # 长序列桶降 batch：控制 [B,L,L,N_BINS] 距离张量 + attention 内存，避免最长桶 OOM
-        if n_buckets >= 4:
-            batch_sizes[-3] = max(16, cfg.train.batch_size // 2)  # 384~448 桶
-            batch_sizes[-2] = max(8, cfg.train.batch_size // 4)   # 448~512 桶
+        batch_sizes = [bs] * n_buckets
+        # 长序列桶降 batch：控制 [B,L,L,N_BINS] 距离张量 + attention 内存。
+        # 内存 ~ B·L²：L≈383 若用满 batch 96 会产生 [96,383,383,24]（~1.4GB fp32）
+        # 在显存较紧的 GPU（如 Kaggle）上 LogSoftmax OOM。按桶上界递减：
+        #   ≥256 折半、≥320 四分之一、≥448 八分之一。
+        for i, hi in enumerate(boundaries):
+            if hi >= 448:
+                batch_sizes[i] = max(2, bs // 8)
+            elif hi >= 320:
+                batch_sizes[i] = max(4, bs // 4)
+            elif hi >= 256:
+                batch_sizes[i] = max(8, bs // 2)
+        batch_sizes[-1] = max(2, bs // 8)  # 溢出桶（≤max_seq_len 时不会到）
         ds = ds.bucket_by_sequence_length(
             element_length_func=_bucket_length_fn,
             bucket_boundaries=boundaries,
@@ -143,7 +166,7 @@ def _make_padded_dataset(cfg: Config, split: str):
             ds = ds.shuffle(2000, reshuffle_each_iteration=True)
     else:
         ds = ds.padded_batch(
-            cfg.train.batch_size,
+            bs,
             padded_shapes=padded_shapes,
             padding_values=padding_values,
             drop_remainder=False,
@@ -167,12 +190,12 @@ def train_step(model, optimizer, x, y, grad_clip, use_loss_scale,
         out = model(x, training=True)
         # 主目标：binned distogram CE（学距离分布 = 接触 = 拓扑）+ 小权重坐标距离 aux。
         # Kabsch 坐标回归路径病态（塌缩梯度死锁），从训练梯度移除，仅作 val 质量指标。
-        unscaled_loss = (
-            dist_weight * distogram_ce_loss(
-                out["dist_logits"], y, x["mask"], dist_bins, dist_min, dist_max
-            )
-            + pair_weight * pairwise_coord_loss(out["coords"], y, x["mask"])
+        # 分开返回 ce / pair：总 loss 被 pair aux 噪声主导看不出趋势，日志直接看纯 CE。
+        ce = dist_weight * distogram_ce_loss(
+            out["dist_logits"], y, x["mask"], dist_bins, dist_min, dist_max
         )
+        pair = pair_weight * pairwise_coord_loss(out["coords"], y, x["mask"])
+        unscaled_loss = ce + pair
         rmsd = tf.reduce_mean(kabsch_rmsd(out["coords"], y, x["mask"]))
         loss = optimizer.scale_loss(unscaled_loss)
     grads = tape.gradient(loss, model.trainable_variables)
@@ -183,8 +206,11 @@ def train_step(model, optimizer, x, y, grad_clip, use_loss_scale,
         grads, _ = tf.clip_by_global_norm(grads, grad_clip * scale)
     else:
         grads, _ = tf.clip_by_global_norm(grads, grad_clip)
+    # NaN/Inf 安全：把非有限梯度替换为 0。单个坏样本 / fp16 溢出时，
+    # 若让 NaN 梯度进 apply_gradients，权重会被污染成 NaN 且永不恢复（后续 step 全 NaN）。
+    grads = [tf.where(tf.math.is_finite(g), g, tf.zeros_like(g)) for g in grads]
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
-    return unscaled_loss, rmsd
+    return unscaled_loss, ce, pair, rmsd
 
 
 @tf.function(reduce_retracing=True)
@@ -213,56 +239,123 @@ def train(cfg: Config) -> None:
     gpus = tf.config.list_physical_devices("GPU")
     print(f"GPU 开关: {'ON ' + str(gpus) if cfg.train.use_gpu and gpus else 'OFF (CPU)'}")
 
-    model = SPICEPretrainModel(cfg.model)
-    # Keras 3 惰性构建：先用 dummy 输入前向一次创建变量
-    model(
-        {
-            "tokens": tf.zeros([1, 8], tf.int32),
-            "env": tf.zeros([1, 3]),
-            "mask": tf.ones([1, 8]),
-        },
-        training=False,
-    )
-    lr_schedule = build_lr_schedule(cfg)
-    optimizer = tf.keras.optimizers.AdamW(
-        learning_rate=lr_schedule, weight_decay=cfg.train.weight_decay
-    )
-    # 混合精度需要 LossScaleOptimizer 做梯度缩放（防 fp16 下溢）
-    if cfg.train.use_mixed_precision:
-        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
-    lr_opt = optimizer.inner_optimizer if cfg.train.use_mixed_precision else optimizer
-    # Keras 3 优化器的动量/速度槽是惰性创建的：在 tf.function 外预先 build，
-    # 避免 apply_gradients 在图内创建变量触发
-    # "tf.function only supports singleton tf.Variables created on the first call"
-    optimizer.build(model.trainable_variables)
+    # 多卡数据并行：>1 张 GPU 时启用 MirroredStrategy（单卡/CPU 走原路径，行为不变）
+    strategy = None
+    if len(gpus) > 1:
+        strategy = tf.distribute.MirroredStrategy()
+        print(f"多卡训练: MirroredStrategy（{strategy.num_replicas_in_sync} 张 GPU，"
+              f"全局 batch={cfg.train.batch_size}）")
+
+    scope = strategy.scope() if strategy is not None else nullcontext()
+    with scope:
+        model = SPICEPretrainModel(cfg.model)
+        # Keras 3 惰性构建：先用 dummy 输入前向一次创建变量
+        model(
+            {
+                "tokens": tf.zeros([1, 8], tf.int32),
+                "env": tf.zeros([1, 3]),
+                "mask": tf.ones([1, 8]),
+            },
+            training=False,
+        )
+        # 每 epoch 步数 & 总步数：LR cosine 按真实训练时长退火（max_steps=0 时不再退化成常数 1e-3）
+        steps_per_epoch = _count_split_records(cfg, "train") // cfg.train.batch_size
+        total_steps = cfg.train.max_steps or max(steps_per_epoch * cfg.train.epochs, 1)
+        lr_schedule = build_lr_schedule(cfg, total_steps=total_steps)
+        optimizer = tf.keras.optimizers.AdamW(
+            learning_rate=lr_schedule, weight_decay=cfg.train.weight_decay
+        )
+        # 混合精度需要 LossScaleOptimizer 做梯度缩放（防 fp16 下溢）
+        if cfg.train.use_mixed_precision:
+            optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+        lr_opt = optimizer.inner_optimizer if cfg.train.use_mixed_precision else optimizer
+        # Keras 3 优化器的动量/速度槽是惰性创建的：在 tf.function 外预先 build，
+        # 避免 apply_gradients 在图内创建变量触发
+        # "tf.function only supports singleton tf.Variables created on the first call"
+        optimizer.build(model.trainable_variables)
 
     # 可训练参数统计
     n_params = sum(int(np.prod(v.shape)) for v in model.trainable_variables)
     print(f"SPICE Pre-train model 参数量: {n_params:,}")
 
-    # checkpoint 恢复
+    # checkpoint 恢复（自动跳过 NaN 污染 / 版本不兼容的 checkpoint：从最新往回找第一个可用的）
     ckpt = tf.train.Checkpoint(
         model=model, optimizer=optimizer, step=tf.Variable(0, dtype=tf.int64)
     )
     manager = tf.train.CheckpointManager(
         ckpt, cfg.train.ckpt_dir, max_to_keep=3
     )
+    restored = False
     if manager.latest_checkpoint:
-        ckpt.restore(manager.latest_checkpoint)
-        print(f"已恢复 checkpoint: {manager.latest_checkpoint}")
+
+        def _weights_finite(m):
+            """全部可训练权重都有限（NaN/Inf 出现在任意一层都视为坏 checkpoint）。"""
+            return all(bool(tf.reduce_all(tf.math.is_finite(v)).numpy())
+                       for v in m.trainable_variables)
+
+        for cp in reversed(manager.checkpoints):   # checkpoints 旧→新，反转 = 从最新往回
+            # 1) 尝试完整恢复（模型 + 优化器动量 + 步数）
+            try:
+                ckpt.restore(cp).expect_partial()
+                if _weights_finite(model):
+                    print(f"已恢复 checkpoint: {cp}（权重+优化器 ✅）")
+                    restored = True
+                    break
+                print(f"⚠️ 跳过 NaN 污染 checkpoint: {cp}（权重含非有限值）")
+                continue
+            except Exception as e:
+                # 完整恢复失败（多为优化器 dtype/版本不兼容，如 RestoreV2 step_counter）
+                print(f"⚠️ 完整恢复 {cp} 失败（{type(e).__name__}: {e}），尝试仅恢复权重")
+            # 2) 退化为仅恢复模型权重 + 全局步数（丢弃优化器动量，lr 重新 warmup）
+            try:
+                ckpt_fb = tf.train.Checkpoint(model=model, step=ckpt.step)
+                ckpt_fb.restore(cp).expect_partial()
+                if _weights_finite(model):
+                    print(f"已恢复 checkpoint: {cp}（仅权重+步数，动量丢弃 ✅）")
+                    restored = True
+                    break
+                print(f"⚠️ 跳过 NaN 污染 checkpoint: {cp}")
+            except Exception as e2:
+                print(f"⚠️ 跳过不可用 checkpoint {cp}: {type(e2).__name__}: {e2}")
+        if not restored:
+            print("⚠️ 没有任何可用的 checkpoint（全被 NaN/版本污染）——从随机初始化开始")
     global_step = int(ckpt.step)
 
-    train_ds = _make_padded_dataset(cfg, "train")
-    val_ds = _make_padded_dataset(cfg, "val")
+    if strategy is not None:
+        train_ds = strategy.distribute_datasets_from_function(
+            lambda input_context: _make_padded_dataset(
+                cfg, "train",
+                batch_size=input_context.get_per_replica_batch_size(cfg.train.batch_size),
+            )
+        )
+        val_ds = strategy.distribute_datasets_from_function(
+            lambda input_context: _make_padded_dataset(
+                cfg, "val",
+                batch_size=input_context.get_per_replica_batch_size(cfg.train.batch_size),
+            )
+        )
+    else:
+        train_ds = _make_padded_dataset(cfg, "train")
+        val_ds = _make_padded_dataset(cfg, "val")
+
+    # 断点续训：从上次 global_step 对应的 epoch 继续，跳过已训练步数（不重走前面数据）
+    start_epoch = min(global_step // max(steps_per_epoch, 1), cfg.train.epochs)
+    skip_in_epoch = global_step - start_epoch * steps_per_epoch
+    if start_epoch >= cfg.train.epochs:
+        print(f"== 已跑满 {cfg.train.epochs} epoch（global_step={global_step}），无需再训练 ==")
+        return
+    if global_step > 0:
+        print(f"== 断点续训：从 epoch {start_epoch} 继续（跳过本 epoch 前 {skip_in_epoch} 步）==", flush=True)
 
     # 进度条（可选）：有 tqdm 时显示 step / loss / lr / ETA
     pbar = None
     if _HAS_TQDM:
         if cfg.train.max_steps:
-            pbar_total = cfg.train.max_steps
+            pbar_total = max(cfg.train.max_steps - global_step, 1)
         else:
-            steps_per_epoch = _count_split_records(cfg, "train") // cfg.train.batch_size
-            pbar_total = max(cfg.train.epochs * steps_per_epoch, 1)
+            pbar_total = max(
+                (cfg.train.epochs - start_epoch) * steps_per_epoch - skip_in_epoch, 1
+            )
         pbar = tqdm(
             total=pbar_total, unit="step", desc="SPICE pretrain", dynamic_ncols=True
         )
@@ -276,38 +369,93 @@ def train(cfg: Config) -> None:
             with writer.as_default():
                 tf.summary.scalar(tag, value, step=step)
 
-    for epoch in range(cfg.train.epochs):
-        print(f"== epoch {epoch}/{cfg.train.epochs} 开始 ==", flush=True)
-        ep_loss = 0.0
-        ep_steps = 0
-        for x, y in train_ds:
-            dist_loss, rmsd = train_step(
+    # 训练/验证 step 分发：多卡走 strategy.run + 归并；单卡走原逻辑（输入为 (x,y) 或 PerReplica）。
+    # ⚠️ 不要在这里给闭包加 @tf.function——捕获 cfg/model/optimizer/strategy 的闭包会触发
+    #    AutoGraph closure-mismatch bug（"requested ('cfg','model','strategy')... "→ TypeError）。
+    #    train_step/val_step 本身已是模块级 @tf.function，strategy.run 分发时会复用其 trace，性能不掉。
+    if strategy is not None:
+
+        def run_train_step(dist_inputs):
+            x, y = dist_inputs
+            per_replica = strategy.run(
+                train_step,
+                args=(model, optimizer, x, y, cfg.train.grad_clip,
+                      cfg.train.use_mixed_precision, cfg.train.dist_weight,
+                      cfg.model.dist_bins, cfg.model.dist_min, cfg.model.dist_max,
+                      cfg.train.pair_weight),
+            )
+            n = strategy.num_replicas_in_sync
+            return tuple(strategy.reduce("SUM", v, axis=None) / n for v in per_replica)
+
+        def run_val_step(dist_inputs):
+            x, y = dist_inputs
+            per_replica = strategy.run(
+                val_step,
+                args=(model, x, y, cfg.model.dist_bins,
+                      cfg.model.dist_min, cfg.model.dist_max),
+            )
+            n = strategy.num_replicas_in_sync
+            return tuple(strategy.reduce("SUM", v, axis=None) / n for v in per_replica)
+    else:
+
+        def run_train_step(inputs):
+            x, y = inputs
+            return train_step(
                 model, optimizer, x, y, cfg.train.grad_clip,
-                cfg.train.use_mixed_precision,
-                cfg.train.dist_weight,
+                cfg.train.use_mixed_precision, cfg.train.dist_weight,
                 cfg.model.dist_bins, cfg.model.dist_min, cfg.model.dist_max,
                 cfg.train.pair_weight,
             )
+
+        def run_val_step(inputs):
+            x, y = inputs
+            return val_step(model, x, y, cfg.model.dist_bins,
+                            cfg.model.dist_min, cfg.model.dist_max)
+
+    for epoch in range(start_epoch, cfg.train.epochs):
+        print(f"== epoch {epoch}/{cfg.train.epochs} 开始 ==", flush=True)
+        ep_loss = 0.0
+        ep_steps = 0
+        ep_nan_steps = 0
+        if epoch == start_epoch and skip_in_epoch > 0:
+            # 续训的第一个 epoch：跳掉已训练的 skip_in_epoch 个 batch（其余 epoch 正常完整迭代）
+            it = iter(train_ds)
+            for _ in range(skip_in_epoch):
+                next(it)
+            step_iter = it
+        else:
+            step_iter = iter(train_ds)
+        for dist_inputs in step_iter:
+            dist_loss, ce_loss, pair_loss, rmsd = run_train_step(dist_inputs)
             global_step += 1
             ckpt.step.assign(global_step)
-            ep_loss += float(dist_loss)
             ep_steps += 1
+            # NaN 安全：单个坏 batch 的 loss 会是 NaN（梯度已置零、权重无恙），
+            # 但若不剔除，会污染整个 epoch 的均值（mean(…, NaN)=NaN）。这里只累加有限值，另计 NaN 步数。
+            dl = float(dist_loss)
+            if np.isfinite(dl):
+                ep_loss += dl
+            else:
+                ep_nan_steps += 1
 
             if pbar is not None:
                 pbar.update(1)
-                pbar.set_postfix(loss=f"{float(dist_loss):.4f}")
+                pbar.set_postfix(loss=f"{float(dist_loss):.4f}", ce=f"{float(ce_loss):.2f}")
 
             if global_step % cfg.train.log_every == 0:
                 # Keras 3：optimizer.learning_rate 是属性，返回当前 LR 张量（schedule 自动按 iterations 求值）
                 lr_now = float(lr_opt.learning_rate)
                 line = (
                     f"[epoch {epoch}] step {global_step} | dist {float(dist_loss):.4f} "
+                    f"| ce {float(ce_loss):.4f} | pair {float(pair_loss):.4f} "
                     f"| rmsd {float(rmsd):.4f} Å | lr {lr_now:.2e} | "
                     f"{time.time()-start:.0f}s"
                 )
                 # 始终用普通 print 输出完整一行（tqdm 会在进度条下方自动重绘，不会吞掉）
                 print(line, flush=True)
                 _log_scalar("train/dist", dist_loss, global_step)
+                _log_scalar("train/ce", ce_loss, global_step)
+                _log_scalar("train/pair", pair_loss, global_step)
                 _log_scalar("train/rmsd", rmsd, global_step)
                 _log_scalar("train/lr", lr_now, global_step)
 
@@ -317,22 +465,24 @@ def train(cfg: Config) -> None:
                 break
 
         # 验证（val 文件数可能为 0，例如只有 1 个 TFRecord 时）
-        avg_train = ep_loss / max(ep_steps, 1)
+        avg_train = ep_loss / max(ep_steps - ep_nan_steps, 1)
         val_dists, val_rmsds, val_n = 0.0, 0.0, 0
-        for x, y in val_ds:
-            vr, vd = val_step(
-                model, x, y, cfg.model.dist_bins, cfg.model.dist_min, cfg.model.dist_max
-            )
-            b = int(tf.shape(x["tokens"])[0])
+        for dist_inputs in val_ds:
+            vr, vd = run_val_step(dist_inputs)
+            if strategy is None:
+                b = int(tf.shape(dist_inputs[0]["tokens"])[0])
+            else:
+                b = cfg.train.batch_size
             val_dists += float(vd) * b
             val_rmsds += float(vr) * b
             val_n += b
         if val_n > 0:
             val_dist = val_dists / val_n
             val_rmsd = val_rmsds / val_n
+            nan_note = f" | ⚠️NaN步 {ep_nan_steps}/{ep_steps}" if ep_nan_steps else ""
             print(
                 f"== epoch {epoch} done | train_dist {avg_train:.4f} | "
-                f"val_dist {val_dist:.4f} | val_rmsd {val_rmsd:.4f} Å =="
+                f"val_dist {val_dist:.4f} | val_rmsd {val_rmsd:.4f} Å{nan_note} =="
             )
             _log_scalar("val/dist", val_dist, global_step)
             _log_scalar("val/rmsd", val_rmsd, global_step)

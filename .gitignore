@@ -15,11 +15,7 @@ venv/
 env/
 
 # --- Data / artifacts ---
-data/raw/
-data/cache/
-data/parquet/
-data/tfrecords/
-data/pseudo_labels/
+data/
 *.tfrecord
 *.npz
 *.parquet

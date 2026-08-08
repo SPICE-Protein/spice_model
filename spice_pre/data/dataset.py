@@ -131,8 +131,13 @@ def _records_from_shard(
     at = pl.read_parquet(atoms_path).filter(pl.col("is_ca"))
     at = at.filter(pl.col("pdb_id").is_in(en["pdb_id"].to_list()))
     at = at.sort(["pdb_id", "chain_id", "res_seq"])
-    # 多构象（NMR）去重：同一 (chain, res_seq) 取第一条
+    # 多构象（NMR）/ 交替构象去重：同一 (chain, res_seq) 取第一条。
+    # ⚠️ polars unique(keep="first") 会按唯一键分组重排，破坏行序！
+    # 必须在其后重新按骨架顺序 (pdb_id, chain_id, res_seq) 排序，
+    # 否则序列↔坐标不对齐（相邻残基 Cα 距离 ~20Å 而非 ~3.8Å），
+    # 模型永远学不出拓扑（曾导致 pre-train 出 blob、CE 卡在均匀基线）。
     at = at.unique(subset=["pdb_id", "chain_id", "res_seq"], keep="first")
+    at = at.sort(["pdb_id", "chain_id", "res_seq"])
 
     env_map = {r["pdb_id"]: r for r in en.to_dicts()}
     records: List[dict] = []

@@ -28,7 +28,7 @@ model:
   dist_max: 48.0     # distogram 最大距离（Å），超出落溢出 bin
 
 train:
-  batch_size: 64         # 128 OOMs on the longest 512 bucket (L^2 memory for pairwise dist + attention); 64 is the safe sweet spot
+  batch_size: 96         # 64→96 with mixed_float16 (fp16 激活省一半内存)；最长 512 桶仍自动降 16-32；若 OOM 退回 64
   epochs: 30
   lr: 1.0e-3           # after collapse is broken lr is an effective lever; raised 3e-4 -> 1e-3 (3x)
   weight_decay: 1.0e-4
@@ -43,8 +43,8 @@ train:
   max_steps: 0       # 0 = run all epochs
   cache_train: true  # pre-cache an epoch's batches in RAM so the pipeline never stalls compute (first pass slow, then pure RAM)
   dist_weight: 1.0   # binned distogram CE 权重（主目标）
-  pair_weight: 0.3   # 坐标两两距离 RMSE 辅助权重（略小，给坐标头兜底）
+  pair_weight: 0.05  # 0.3→0.05：坐标头 rmsd 乱跳(17-28Å)的噪声梯度干扰 CE 学习，下调让 CE 主导
   use_gpu: true      # true = 用 GPU（若有）；false = 强制只用 CPU
   gpu_mem_growth: true  # 显存按需增长
   gpu_devices: ""    # 指定 GPU 编号白名单，如 "0" / "0,1"；空 = 全部
-  use_mixed_precision: false
+  use_mixed_precision: true   # FP32→fp16 混合精度：T4 上 ~2-4x 提速。distogram 头/Kabsch 已强制 fp32，loss-scale + clip-scale 已在 train_step 处理
