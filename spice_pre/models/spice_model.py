@@ -1,14 +1,10 @@
-"""SPICE Pre-train 模型：动态 Transformer + AdaLN + 双路四头（当前启用 Head A）。
-
-Phase 1（Pre-train）只训练 Head A（坐标头）：输入 (Seq, Env)，输出 Cα 坐标 [L, 3]。
-Head B / B' / C / D 为 Phase 2（RL）预留，默认注册但不参与本阶段 loss。
-"""
 from __future__ import annotations
 
 import tensorflow as tf
 
 from spice_pre.config import ModelConfig
 from spice_pre.keras_utils import register_keras_serializable
+from spice_pre.models.structure import FrameStructureHead
 from spice_pre.models.transformer import TransformerEncoder, sinusoidal_positions
 
 
@@ -23,13 +19,11 @@ class SPICEPretrainModel(tf.keras.Model):
         self.env_dim = config.env_dim
         self.pos_max_len = config.pos_max_len
 
-        # token embedding + 位置编码
         self.token_embed = tf.keras.layers.Embedding(
             config.vocab_size, config.embed_dim, mask_zero=True, name="token_embed"
         )
         self.input_dropout = tf.keras.layers.Dropout(config.dropout)
 
-        # 动态 Transformer 编码器（AdaLN 环境注入）
         self.encoder = TransformerEncoder(
             embed_dim=config.embed_dim,
             num_layers=config.num_layers,
@@ -40,18 +34,16 @@ class SPICEPretrainModel(tf.keras.Model):
             name="transformer_encoder",
         )
 
-        # Head A：坐标头（路径 A）—— Pre-train 唯一监督头
-        self.head_a = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(config.embed_dim, activation="gelu"),
-                tf.keras.layers.Dropout(config.dropout),
-                tf.keras.layers.Dense(3, name="head_a_coords"),
-            ],
+        self.head_a = FrameStructureHead(
+            config.embed_dim,
+            bond_length=getattr(config, "bond_length", 3.8),
+            dropout=config.dropout,
+            recycle_steps=getattr(config, "frame_recycle_steps", 0),
+            refine_dim=getattr(config, "frame_refine_dim", 64),
+            refine_heads=getattr(config, "frame_refine_heads", 4),
             name="head_a",
         )
 
-        # 辅助头：binned distogram（预测每对残基距离分布 [B,L,L,N_BINS]）
-        # 因子化双线性 + 对称化：logits[b,i,j,k] = sum_d u[i,d]·W[k,d]·u[j,d]
         self.dist_proj = tf.keras.layers.Dense(config.dist_dim, name="dist_proj")
         self.dist_bin_weights = self.add_weight(
             name="dist_bin_weights",
@@ -60,20 +52,14 @@ class SPICEPretrainModel(tf.keras.Model):
             trainable=True,
         )
 
-        # ---- 预留头（Phase 2 RL 使用；Pre-train 默认不实例化）----
-        # Head B：突变概率矩阵 [L, 20]
         self.head_b = (
             tf.keras.layers.Dense(20, name="head_b_mutation") if "B" in self.heads else None
         )
-        # Head B'：突变后坐标 [L, 3]
-        self.head_bp = (
-            tf.keras.layers.Dense(3, name="head_bp_coords") if "Bp" in self.heads else None
-        )
-        # Head C：环境偏移 [ΔpH, ΔT]
+        # Head B' 已由独立 Dense(3) 直接坐标回归 → 移除：改为 Head A 对(突变)序列的折叠
+        # （frame 结构头 + SE(3) recycling，键长由构造保证 3.8Å）。见 call() 中 coords_mut 别名。
         self.head_c = (
             tf.keras.layers.Dense(2, name="head_c_env_offset") if "C" in self.heads else None
         )
-        # Head D：双路置信度 [0,1] x2
         self.head_d = (
             tf.keras.layers.Dense(2, activation="sigmoid", name="head_d_confidence")
             if "D" in self.heads
@@ -81,42 +67,56 @@ class SPICEPretrainModel(tf.keras.Model):
         )
 
     def build(self, input_shape=None):
-        """Keras 3 要求 subclass model 显式声明 build（层都在 __init__ 构建）。"""
         super().build(input_shape)
 
     def call(self, inputs, training: bool = False):
-        """inputs: dict {tokens:[B,L] int, env:[B,C] float, mask:[B,L] float}"""
         tokens = inputs["tokens"]
         env = inputs["env"]
         mask = inputs["mask"]
 
         b, l = tf.shape(tokens)[0], tf.shape(tokens)[1]
-        x = self.token_embed(tokens)                       # [B, L, D]
-        # mixed_float16 下 x 是 fp16：位置编码按 x.dtype 生成，避免 fp16+fp32 报错
+        x = self.token_embed(tokens)                       
         pos = tf.cast(
             sinusoidal_positions(l, self.embed_dim), x.dtype
-        )[None, :, :]                                      # [1, L, D]
+        )[None, :, :]                                      
         x = x + pos
         x = self.input_dropout(x, training=training)
 
-        z = self.encoder(x, env, mask, training=training)  # [B, L, D]
+        z = self.encoder(x, env, mask, training=training)  
 
-        out = {"coords": self.head_a(z), "z": z}           # Head A
+        out = {"coords": self.head_a(z, mask, training=training), "z": z}           
 
-        # 辅助 distogram：binned 距离分布 logits [B,L,L,N_BINS]，对称化（fp32 避免溢出/混合精度 dtype 冲突）
-        u = tf.cast(self.dist_proj(z), tf.float32)                # [B,L,D2]
-        w = tf.cast(self.dist_bin_weights, tf.float32)            # [N,D2]
-        uw = tf.einsum("bid,kd->bikd", u, w)                      # [B,L,N,D2]
-        logits = tf.einsum("bikd,bjd->bijk", uw, u)              # [B,L,L,N]
+        if getattr(self.cfg, "distogram_fp16", False):
+            # ⚠️ fp16 distogram（护栏版）：先把 u/w 按 batch 归一化到健康区间（~O(1)），
+            # fp16 einsum（T4 tensor core 约 8× 于 fp32），再按比例还原。
+            # 误差≈fp16 精度（0.1-1%），且 logits16 ≤ dist_dim 永不溢出；CE 仍 fp32 稳定。
+            u32 = tf.cast(self.dist_proj(z), tf.float32)
+            w32 = tf.cast(self.dist_bin_weights, tf.float32)
+            u_scale = tf.maximum(tf.reduce_max(tf.abs(u32), axis=[1, 2]), 1e-6)  # [B]
+            w_scale = tf.maximum(tf.reduce_max(tf.abs(w32)), 1e-6)               # scalar
+            u_n = u32 / u_scale[:, None, None]
+            w_n = w32 / w_scale
+            uw = tf.einsum("bid,kd->bikd", tf.cast(u_n, tf.float16),
+                           tf.cast(w_n, tf.float16))
+            logits = tf.einsum("bikd,bjd->bijk", uw, tf.cast(u_n, tf.float16))
+            # 还原：logits_orig = u_scale² · w_scale · logits_normed
+            logits = tf.cast(logits, tf.float32) * (
+                u_scale * u_scale * w_scale)[:, None, None, None]
+        else:
+            u = tf.cast(self.dist_proj(z), tf.float32)                
+            w = tf.cast(self.dist_bin_weights, tf.float32)            
+            uw = tf.einsum("bid,kd->bikd", u, w)                      
+            logits = tf.einsum("bikd,bjd->bijk", uw, u)              
         out["dist_logits"] = logits + tf.transpose(logits, perm=[0, 2, 1, 3])
 
-        # 预留头（RL 阶段启用）
         if self.head_d is not None:
             out["conf"] = self.head_d(tf.reduce_mean(z, axis=1))
         if self.head_b is not None:
             out["mutation"] = self.head_b(z)
-        if self.head_bp is not None:
-            out["coords_mut"] = self.head_bp(z)
+        if "Bp" in self.heads:
+            # Head B' = 突变序列经 Head A(frame 结构头+recycle) 的折叠：键长由构造保证 3.8Å，
+            # 实测 Rg≈13Å 真实折叠；替代旧 Dense(3) 直接回归的 blob（曾致建突变体 equil 全炸）。
+            out["coords_mut"] = out["coords"]
         if self.head_c is not None:
             out["env_offset"] = self.head_c(tf.reduce_mean(z, axis=1))
         return out

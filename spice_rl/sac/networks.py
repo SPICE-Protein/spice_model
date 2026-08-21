@@ -1,18 +1,3 @@
-"""SPICE-SAC 网络：双头 Actor + TwinCritic（特权信息）。
-
-定制 2（混合动作解耦输出头）：
-- 连续头：偏置力基元系数 [M=16] + 环境偏移 [ΔpH, ΔT] → 各向同性高斯（重参数化）
-- 离散头：突变位置 [L] + 目标氨基酸类型 [20] → Categorical，Gumbel-Softmax（τ=1）采样，
-  输出 soft one-hot（可微）；两个动作拼接为平坦向量输入 Critic。
-
-定制 3（特权信息）：
-- Actor 输入：仅 z + env（不含物理指标 M）
-- Critic 输入：z + M + u_hist(10) + 连续动作 + 离散动作 + mutation_mask
-
-定制 5（分层动作时序）：
-- 每步都采样完整动作向量；`mutation_allowed` 决定离散头是否"生效"。
-  buffer 存原始输出 + mutation_mask，Critic 依掩码学习（Q 目标中离散熵项 × mask）。
-"""
 from __future__ import annotations
 
 import numpy as np
@@ -26,7 +11,6 @@ LOG_STD_MAX = 2.0
 
 
 def gumbel_softmax(logits, tau: float, hard: bool = False):
-    """Gumbel-Softmax（τ 温度，hard 时 straight-through one-hot）。"""
     gumbels = -tf.math.log(
         -tf.math.log(tf.random.uniform(tf.shape(logits), dtype=logits.dtype) + 1e-20) + 1e-20
     )
@@ -40,12 +24,13 @@ def gumbel_softmax(logits, tau: float, hard: bool = False):
 def _gaussian_log_prob(action, mean, log_std):
     std = tf.exp(log_std)
     log_prob = -0.5 * tf.square((action - mean) / std) - log_std - 0.5 * np.log(2 * np.pi)
-    return tf.reduce_sum(log_prob, axis=-1)
+    log_prob = tf.reduce_sum(log_prob, axis=-1)
+    # 2026-08-17 Prevent -inf/inf/NaN propagation from extreme continuous values
+    return tf.where(tf.math.is_finite(log_prob), log_prob, tf.zeros_like(log_prob))
 
 
 @register_keras_serializable(package="spice_rl")
 class SacActor(tf.keras.Model):
-    """双头 Actor：连续（高斯）+ 离散（Gumbel-Softmax 突变）。"""
 
     def __init__(
         self,
@@ -57,13 +42,12 @@ class SacActor(tf.keras.Model):
     ):
         super().__init__(**kwargs)
         self.cfg = cfg
-        self.cont_dim = cont_dim               # 连续动作维度（force + env offset）
+        self.cont_dim = cont_dim               
         self.z_dim = z_dim
         self.env_dim = env_dim
-        self.disc_pos_dim = cfg.discrete_position_dim  # L_max
+        self.disc_pos_dim = cfg.discrete_position_dim  
         self.aa_dim = cfg.aa_dim
 
-        # 连续头
         self.cont_trunk = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(cfg.hidden_dim, activation="relu"),
@@ -74,7 +58,6 @@ class SacActor(tf.keras.Model):
         self.mean_head = tf.keras.layers.Dense(cont_dim, name="actor_mean")
         self.log_std_head = tf.keras.layers.Dense(cont_dim, name="actor_log_std")
 
-        # 离散头（突变）：z_pool → 位置分布 + 氨基酸类型分布
         self.disc_trunk = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(cfg.hidden_dim, activation="relu"),
@@ -87,8 +70,8 @@ class SacActor(tf.keras.Model):
         )
         self.aa_logits_head = tf.keras.layers.Dense(self.aa_dim, name="actor_mut_aa_logits")
 
-    # ---------------- 连续头 ----------------
     def cont_dist(self, z, env):
+        z = tf.clip_by_value(z, -1e3, 1e3)  # 2026-08-19 Tertiary guard: prevents amplification of extreme latent z values
         h = self.cont_trunk(tf.concat([z, env], axis=-1))
         mean = self.mean_head(h)
         log_std = tf.clip_by_value(self.log_std_head(h), LOG_STD_MIN, LOG_STD_MAX)
@@ -99,35 +82,38 @@ class SacActor(tf.keras.Model):
         action = mean + tf.exp(log_std) * tf.random.normal(tf.shape(mean))
         return action, _gaussian_log_prob(action, mean, log_std)
 
-    # ---------------- 离散头 ----------------
     def disc_logits(self, z, z_mask):
-        """z_mask: [B, L_max] float（1=有效残基）→ (pos_logits, aa_logits)。"""
+        z = tf.clip_by_value(z, -1e3, 1e3)  # 2026-08-19 Tertiary guard: prevents amplification of extreme latent z values
         h = self.disc_trunk(z)
-        pos_logits = self.pos_logits_head(h)              # [B, L_max]
+        pos_logits = self.pos_logits_head(h)              
         mask = tf.cast(z_mask, pos_logits.dtype)
         pos_logits = tf.where(mask > 0.5, pos_logits, -1e9)
-        aa_logits = self.aa_logits_head(h)                # [B, 20]
+        aa_logits = self.aa_logits_head(h)                
         return pos_logits, aa_logits
 
     def sample_disc(self, z, z_mask):
-        """Gumbel-Softmax 采样 soft one-hot 离散动作 + 离散 log_pi（交叉熵）。"""
         pos_logits, aa_logits = self.disc_logits(z, z_mask)
         pos_soft = gumbel_softmax(pos_logits, self.cfg.gumbel_tau)
         aa_soft = gumbel_softmax(aa_logits, self.cfg.gumbel_tau)
+        
+        # 2026-08-17 Gumbel-Softmax NaN Trap Fix:
+        # Masked logits have -1e9, so log_softmax returns -inf. Under IEEE 754 math,
+        # multiplying -inf by 0.0 (from pos_soft) results in NaN.
+        # Washing log_softmax of any non-finite values to 0.0 eliminates this trap.
+        log_pos = tf.nn.log_softmax(pos_logits)
+        log_pos = tf.where(tf.math.is_finite(log_pos), log_pos, tf.zeros_like(log_pos))
+        
+        log_aa = tf.nn.log_softmax(aa_logits)
+        log_aa = tf.where(tf.math.is_finite(log_aa), log_aa, tf.zeros_like(log_aa))
+
         log_pi = (
-            tf.reduce_sum(tf.nn.log_softmax(pos_logits) * pos_soft, axis=-1)
-            + tf.reduce_sum(tf.nn.log_softmax(aa_logits) * aa_soft, axis=-1)
+            tf.reduce_sum(log_pos * pos_soft, axis=-1)
+            + tf.reduce_sum(log_aa * aa_soft, axis=-1)
         )
-        action_disc = tf.concat([pos_soft, aa_soft], axis=-1)  # [B, L_max + 20]
+        action_disc = tf.concat([pos_soft, aa_soft], axis=-1)  
         return action_disc, log_pi
 
-    # ---------------- 完整采样 ----------------
     def sample(self, z, env, z_mask, mutation_allowed=None):
-        """返回混合动作与总 log_pi。
-
-        mutation_allowed: [B] bool/float。False 时离散熵项不计入 log_pi
-        （分层动作：该步不允许突变）。
-        """
         action_cont, log_pi_cont = self.sample_cont(z, env)
         action_disc, log_pi_disc = self.sample_disc(z, z_mask)
         if mutation_allowed is not None:
@@ -147,10 +133,6 @@ class SacActor(tf.keras.Model):
 
 @register_keras_serializable(package="spice_rl")
 class TwinCritic(tf.keras.Model):
-    """双 Q 网络（取 min 防高估）。
-
-    输入：z + M + u_hist + 连续动作 + 离散动作 + mutation_mask。
-    """
 
     def __init__(
         self,
@@ -183,9 +165,33 @@ class TwinCritic(tf.keras.Model):
         )
 
     def _feats(self, z, M, u_hist, action_cont, action_disc, mutation_mask):
+        u_ref = getattr(self.cfg, "u_ref", 1e5)
+        if u_ref and u_ref != 1.0:
+            u_hist = u_hist / tf.cast(u_ref, u_hist.dtype)
+        
+        # 2026-08-17 Robust clipping of physical indicators to prevent outlier-driven gradient spikes
+        M = tf.clip_by_value(M, -5.0, 5.0)
+        # 2026-08-19 Secondary guard (born-NaN fix): direct clipping of extreme z and action_cont values
+        # protects the critic's forward pass against unnormalized histories (e.g. legacy replay buffers with unclipped z) or extreme actor outputs.
+        z = tf.clip_by_value(z, -1e3, 1e3)
+        action_cont = tf.clip_by_value(action_cont, -1e3, 1e3)
+
         parts = [z, M, u_hist, action_cont, action_disc]
         if mutation_mask is not None:
-            parts.append(mutation_mask)
+            m = tf.cast(mutation_mask, action_disc.dtype)
+            # Force [batch, 1] shape on mask to guarantee reliable broadcasting and eliminate gradient noise
+            if len(m.shape) == 1:
+                m = tf.expand_dims(m, axis=-1)
+            elif len(m.shape) == 0:
+                m = tf.reshape(m, [1, 1])
+            parts[4] = action_disc * m
+            
+            m_append = mutation_mask
+            if len(m_append.shape) == 1:
+                m_append = tf.expand_dims(m_append, axis=-1)
+            elif len(m_append.shape) == 0:
+                m_append = tf.reshape(m_append, [1, 1])
+            parts.append(m_append)
         return tf.concat(parts, axis=-1)
 
     def call(self, z, M, u_hist, action_cont, action_disc, mutation_mask=None):
@@ -195,3 +201,40 @@ class TwinCritic(tf.keras.Model):
     def min_q(self, z, M, u_hist, action_cont, action_disc, mutation_mask=None):
         q1, q2 = self.call(z, M, u_hist, action_cont, action_disc, mutation_mask)
         return tf.minimum(q1, q2)
+
+
+def install_layer_trace(root, tag: str):
+    """Recursively wraps the `.call` method of all sub-layers in root (e.g. SacActor, TwinCritic, or other Keras Models),
+    logging shape, finiteness, non-finite counts, and absolute maximum of finite values for each layer's output.
+    Used for layer-by-layer troubleshooting of NaN occurrences (e.g. during 6QQE born-NaN investigation) without modifying network logic.
+    Since tf.print is a graph-compatible op, this works seamlessly in both eager and @tf.function graph modes."""
+    seen = set()
+
+    def _trace(layer, full_name):
+        orig = layer.call
+
+        def traced(*args, **kwargs):
+            out = orig(*args, **kwargs)
+            if isinstance(out, tf.Tensor) and out.dtype.is_floating:
+                _fin = tf.reduce_all(tf.math.is_finite(out))
+                _nbad = tf.reduce_sum(tf.cast(tf.logical_not(tf.math.is_finite(out)), tf.int64))
+                _amax = tf.reduce_max(
+                    tf.where(tf.math.is_finite(out), tf.abs(out), tf.zeros_like(out)))
+                tf.print(f"[TRACE:{full_name}] out", tf.shape(out),
+                         "finite", _fin, "nbad", _nbad, "absmax", _amax)
+            return out
+
+        layer.call = traced
+
+    def _walk(mod, path):
+        for l in getattr(mod, "layers", []):
+            if id(l) in seen:
+                continue
+            seen.add(id(l))
+            _full = f"{path}/{l.name}"
+            if isinstance(l, tf.keras.layers.Layer):
+                _trace(l, _full)
+            if getattr(l, "layers", None):
+                _walk(l, _full)
+
+    _walk(root, tag)

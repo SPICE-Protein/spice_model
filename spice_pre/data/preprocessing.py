@@ -1,7 +1,8 @@
-"""Preprocessing：序列编码、环境归一化、坐标提取。
+"""Preprocessing module: sequence tokenization, environmental normalization, and coordinate extraction.
 
-与 download_pdb.py 保持一致的残基命名映射，保证 `seq` 与 Cα 坐标严格对齐
-（序列从 CA 原子行的 res_name 重建，坐标按 (chain_id, res_seq) 排序收集）。
+Maintains a residue naming mapping consistent with download_pdb.py, ensuring strict alignment 
+between reconstructed sequence tokens and Cα coordinates (sequence reconstructed from Cα atom res_names, 
+and coordinates sorted and collected by (chain_id, res_seq)).
 """
 from __future__ import annotations
 
@@ -10,15 +11,15 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# 氨基酸编码
+# Amino Acid Tokenization
 # ---------------------------------------------------------------------------
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 AA2IDX = {aa: i + 1 for i, aa in enumerate(AA_ORDER)}  # 1..20
 PAD_IDX = 0
-UNK_IDX = 21  # X / 未知残基
+UNK_IDX = 21  # X / Unknown residue
 VOCAB_SIZE = 23
 
-# 3-letter -> 1-letter（含质子化变体，与 download_pdb.py 对齐）
+# 3-letter -> 1-letter (including protonated variants, aligned with download_pdb.py)
 RES_NAME_TO_AA = {
     "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
     "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
@@ -30,11 +31,11 @@ RES_NAME_TO_AA = {
 }
 
 # ---------------------------------------------------------------------------
-# 环境归一化范围（与 download_pdb.py 一致）
+# Environmental Normalization Ranges (consistent with download_pdb.py)
 # ---------------------------------------------------------------------------
 PH_MIN, PH_MAX = 0.0, 14.0
 TEMP_MIN, TEMP_MAX = 150.0, 400.0
-IONIC_REF_M = 1.0   # log 映射参考浓度
+IONIC_REF_M = 1.0   # Reference concentration for logarithmic mapping
 
 
 def aa_to_idx(aa: str) -> int:
@@ -42,21 +43,21 @@ def aa_to_idx(aa: str) -> int:
 
 
 def seq_to_tokens(seq: str) -> np.ndarray:
-    """一字母序列 -> int32 token 数组。"""
+    """Converts 1-letter amino acid sequence to int32 token array."""
     return np.array([aa_to_idx(ch) for ch in seq], dtype=np.int32)
 
 
 def res_names_to_seq(res_names: Sequence[str]) -> str:
-    """3-letter 残基名序列 -> 一字母序列。"""
+    """Converts 3-letter residue name sequence to 1-letter amino acid sequence."""
     return "".join(RES_NAME_TO_AA.get(str(n).upper(), "X") for n in res_names)
 
 
 # ---------------------------------------------------------------------------
-# 环境归一化
+# Environmental Normalization
 # ---------------------------------------------------------------------------
 def normalize_pH(ph: Optional[float]) -> float:
     if ph is None:
-        return 0.5  # 默认 pH 7.0 的归一化值
+        return 0.5  # Normalized value for default pH 7.0
     return float(np.clip((ph - PH_MIN) / (PH_MAX - PH_MIN), 0.0, 1.0))
 
 
@@ -67,7 +68,7 @@ def normalize_temp(temp: Optional[float]) -> float:
 
 
 def normalize_ionic(ionic_m: Optional[float], default_m: float = 0.15) -> float:
-    """离子强度对数归一化：1mM~1M 映射到 ~0~1。"""
+    """Logarithmic normalization of ionic strength: maps 1 mM - 1 M range to [0.0, 1.0]."""
     if ionic_m is None:
         ionic_m = default_m
     ionic_m = float(np.clip(ionic_m, 1e-3, 1.0))
@@ -80,7 +81,7 @@ def normalize_env(
     ionic_m: Optional[float],
     default_env: Tuple[float, float, float] = (7.0, 298.0, 0.15),
 ) -> np.ndarray:
-    """返回 [pH_norm, T_norm, ionic_norm] float32。"""
+    """Returns [pH_norm, T_norm, ionic_norm] float32 array."""
     d_ph, d_t, d_i = default_env
     return np.array(
         [
@@ -93,10 +94,10 @@ def normalize_env(
 
 
 # ---------------------------------------------------------------------------
-# 坐标
+# Coordinates
 # ---------------------------------------------------------------------------
 def center_coords(coords: np.ndarray) -> np.ndarray:
-    """减去质心（数值稳定，Kabsch 内部也会去质心）。"""
+    """Subtracts centroid coordinates (essential for numerical stability, also performed inside Kabsch RMSD)."""
     return coords - coords.mean(axis=0, keepdims=True)
 
 

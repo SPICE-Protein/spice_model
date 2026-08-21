@@ -1,8 +1,3 @@
-"""动态 Transformer 编码器（可变长序列 + AdaLN 环境注入）。
-
-支持 batch 内不同长度序列：通过 padding + Attention Mask 批处理，
-环境向量经 AdaLN 逐层注入，输出序列-环境融合表征 z。
-"""
 from __future__ import annotations
 
 import math
@@ -14,9 +9,8 @@ from spice_pre.models.adaln import AdaLN
 
 
 def sinusoidal_positions(seq_len: int, embed_dim: int, dtype=tf.float32) -> tf.Tensor:
-    """正弦位置编码，支持任意长度（无需训练参数）。返回 [seq_len, embed_dim]。"""
-    pos = tf.range(seq_len, dtype=tf.float32)[:, None]          # [L, 1]
-    i = tf.range(embed_dim, dtype=tf.float32)[None, :]          # [1, D]
+    pos = tf.range(seq_len, dtype=tf.float32)[:, None]          
+    i = tf.range(embed_dim, dtype=tf.float32)[None, :]          
     even = tf.cast(tf.math.floormod(i, 2) == 0, tf.float32)
     omega = 1.0 / tf.pow(10000.0, (i // 2) / (embed_dim / 2.0))
     angle = pos * omega
@@ -26,7 +20,6 @@ def sinusoidal_positions(seq_len: int, embed_dim: int, dtype=tf.float32) -> tf.T
 
 @register_keras_serializable(package="spice_pre")
 class TransformerBlock(tf.keras.layers.Layer):
-    """单层：AdaLN → MHA → residual → AdaLN → FFN → residual"""
 
     def __init__(
         self,
@@ -59,10 +52,7 @@ class TransformerBlock(tf.keras.layers.Layer):
         self.dropout = tf.keras.layers.Dropout(dropout)
 
     def call(self, x: tf.Tensor, env: tf.Tensor, mask: tf.Tensor, training: bool = False) -> tf.Tensor:
-        # x: [B, L, D], env: [B, C], mask: [B, L] (1=有效)
-        # Keras MultiHeadAttention 的 attention_mask 是布尔掩码（True=可 attend），
-        # 不是加性偏置。直接把有效位转成 bool，避免掩码反相（只 attend 到 padding）。
-        attn_mask = mask[:, None, None, :] > 0.5   # [B, 1, 1, L] bool，True=有效残基
+        attn_mask = mask[:, None, None, :] > 0.5   
         h = self.adaln1(x, env)
         h = self.attn(h, h, attention_mask=attn_mask)
         x = x + self.dropout(h, training=training)
@@ -86,7 +76,6 @@ class TransformerBlock(tf.keras.layers.Layer):
 
 @register_keras_serializable(package="spice_pre")
 class TransformerEncoder(tf.keras.layers.Layer):
-    """堆叠 N 个 TransformerBlock，输出序列-环境融合表征 z [B, L, D]。"""
 
     def __init__(
         self,

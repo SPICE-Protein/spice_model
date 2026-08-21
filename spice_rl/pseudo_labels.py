@@ -1,33 +1,21 @@
-"""环节四：双路回流 —— 伪标签收集与回流。
-
-路径 B 存活突变体的时间平均坐标（engine.pseudo_labels）构成伪标签
-(突变后Seq, Env_fail, 稳定坐标)，以置信度权重（存活步数占比）回流到
-Pre-train 数据集，触发微调。
-
-流程：
-    pseudo_*.npz（train_post 落盘）→ load_pseudo_labels → write_pseudo_tfrecord
-    → 与 Pre-train 原 TFRecord 合并（make_finetune_dataset）→ finetune_pretrain.py
-"""
 from __future__ import annotations
 
 import glob
 import os
+import logging
 from typing import List, Optional
 
 import numpy as np
 import tensorflow as tf
 
-# 复用 spice_pre 的 TFRecord 序列化/解析（保证格式一致，避免二次实现出错）
 from spice_pre.data.dataset import _make_example, _parse_example
 from spice_pre.data.preprocessing import normalize_env, seq_to_tokens
 
+logger = logging.getLogger("spice")
+
 
 def load_pseudo_labels(pseudo_dir: str) -> List[dict]:
-    """读取伪标签 npz。每条：{seq, env[3](raw ph/temp/ionic), coords[L,3], weight, file}。
-
-    weight = 存活步数（从文件名 pseudo_{idx}_{steps}.npz 解析）。
-    """
-    out = []
+    seen: dict = {}
     for f in sorted(glob.glob(os.path.join(pseudo_dir, "pseudo_*.npz"))):
         try:
             d = np.load(f, allow_pickle=True)
@@ -39,8 +27,15 @@ def load_pseudo_labels(pseudo_dir: str) -> List[dict]:
             continue
         if not seq or coords.ndim != 2 or coords.shape[1] != 3:
             continue
-        out.append({"seq": seq, "env": env, "coords": coords, "weight": steps, "file": f})
-    return out
+        # 2026-08-14：去重（同 seq+env+长度 视为同一伪标签），保留 steps 更高者，防重复加权
+        key = (seq, tuple(env.tolist()), coords.shape[0])
+        if key in seen:
+            if steps > seen[key]["weight"]:
+                seen[key]["weight"] = steps
+                seen[key]["file"] = f
+            continue
+        seen[key] = {"seq": seq, "env": env, "coords": coords, "weight": steps, "file": f}
+    return list(seen.values())
 
 
 def write_pseudo_tfrecord(
@@ -50,11 +45,6 @@ def write_pseudo_tfrecord(
     weight_repeat: int = 8,
     survive_steps: int = 200,
 ) -> int:
-    """把伪标签转成 Pre-train 格式 TFRecord（与 spice_pre 一致）。
-
-    按置信度权重（存活步数占比）重复写入，实现"以置信度权重加入数据集"。
-    Returns: 写入条数。
-    """
     recs = load_pseudo_labels(pseudo_dir)
     if not recs:
         return 0
@@ -82,7 +72,7 @@ def write_pseudo_tfrecord(
             for _ in range(reps):
                 w.write(ex.SerializeToString())
                 count += 1
-    print(f"伪标签回流: {len(recs)} 条 -> {out_path}（加权后 {count} 条）")
+    logger.info(f"伪标签回流: {len(recs)} 条 -> {out_path}（加权后 {count} 条）")
     return count
 
 
@@ -93,11 +83,6 @@ def make_finetune_dataset(
     split: str = "train",
     shuffle_buffer: int = 4096,
 ):
-    """合并 Pre-train 原 TFRecord + 伪标签 TFRecord → tf.data.Dataset。
-
-    返回 (features, coords)，与 spice_pre 的 load_tfrecord_dataset 同构，
-    可直接 padded_batch 后训练。
-    """
     files = sorted(
         glob.glob(os.path.join(cfg.post.pretrain_tfrecord_dir, "shard_*.tfrecord"))
     )

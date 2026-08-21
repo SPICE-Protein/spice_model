@@ -1,15 +1,3 @@
-"""SPICE Pre-train 训练诊断。
-
-在 Colab 里跑（需先同步 spice_pre/ 与 configs/）：
-    python -m spice_pre.diagnose --config configs/pretrain.yaml
-
-逐个验证：
-  [1] lr 调度是否真在给数
-  [2] 数据：真实坐标尺度 / Rg / mask 与坐标长度是否对齐、env 是否正常
-  [3-4] loss：TF 的 kabsch_rmsd vs 独立 numpy 实现（手动对拍）
-  [4] 预测坐标是否塌缩（pred_Rg << true_Rg 即塌缩 → RMSD 梯度死锁，loss 不动的元凶）
-  [5] 梯度是否流通到各模块（encoder / AdaLN / head_a / dist_head / embedding）
-"""
 from __future__ import annotations
 
 import argparse
@@ -25,15 +13,14 @@ from spice_pre.models import SPICEPretrainModel
 
 
 def manual_kabsch_rmsd(pred: np.ndarray, true: np.ndarray) -> float:
-    """独立 numpy 版 Kabsch RMSD（对拍 TF 实现）。输入已按 mask 过滤。"""
     pc = pred - pred.mean(0)
     tc = true - true.mean(0)
     h = pc.T @ tc
     u, _, vt = np.linalg.svd(h)
-    d = np.sign(np.linalg.det(vt.T @ u.T))   # det(V U^T) 修正
+    d = np.sign(np.linalg.det(vt.T @ u.T))   
     uf = u.copy()
     uf[:, -1] *= d
-    r = vt.T @ uf.T                          # R = V U_fix^T
+    r = vt.T @ uf.T                          
     rp = pc @ r.T
     return float(np.sqrt(np.mean(np.sum((rp - tc) ** 2, axis=1))))
 
@@ -50,7 +37,6 @@ def main() -> int:
         tf.keras.mixed_precision.set_global_policy("mixed_float16")
         print("[diag] mixed_float16 ON")
 
-    # [1] lr 调度
     from spice_pre.train_pretrain import build_lr_schedule
 
     sched = build_lr_schedule(cfg)
@@ -59,7 +45,6 @@ def main() -> int:
               cfg.train.warmup_steps * 2, 2000):
         print(f"    step {s:>5d}: lr = {float(sched(s)):.3e}")
 
-    # [2-4] 数据 + 模型前向 + loss 对拍 + 塌缩检查
     model = SPICEPretrainModel(cfg.model)
     model(
         {"tokens": tf.zeros([1, 8], tf.int32), "env": tf.zeros([1, 3]),
@@ -91,7 +76,6 @@ def main() -> int:
             f"true[min={true.min():.3f} max={true.max():.3f}] | env={x['env'].numpy()}"
         )
 
-    # [5] 梯度流通检查（eager 一次）
     print("\n[5] 梯度是否流通到各模块（ZERO/None 即该模块没收到梯度）:")
     opt = tf.keras.optimizers.AdamW(learning_rate=1e-4, weight_decay=cfg.train.weight_decay)
     if cfg.train.use_mixed_precision:

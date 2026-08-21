@@ -1,18 +1,18 @@
-"""数据管线：加载 → 清洗 → TFRecord → tf.data.Dataset。
+"""Data Pipeline: Load -> Clean -> TFRecord -> tf.data.Dataset.
 
-数据来源两种：
-- `hf`：从 HuggingFace（默认 hf-mirror.com 镜像）下载 parquet 分片。
-- `local`：读本地 `data/parquet` 目录（即 download_pdb.py 的产物）。
+Supports two data sources:
+- `hf`: download Parquet shards from HuggingFace (defaults to hf-mirror.com).
+- `local`: read from local `data/parquet` directory (produced by download_pdb.py).
 
-流程：
-1. 对每个 shard：entries（结构元数据）+ atoms（Cα 原子）→ 三元组 (Seq, Env, Coords)。
-2. 清洗过滤（has_env、长度、shard/数量上限）。
-3. 写 TFRecord（一次预处理，训练时快速读取）。
-4. 读 TFRecord → tf.data.Dataset（padded_batch，支持变长）。
+Pipeline steps:
+1. For each shard: parse entries (structural metadata) + atoms (Cα coordinates) into tuples of (Seq, Env, Coords).
+2. Clean and filter (by has_env, sequence length, max shards, structures per shard).
+3. Serialize to TFRecords (one-time preprocessing for fast streaming during training).
+4. Load TFRecord -> tf.data.Dataset (using padded_batch to support variable sequence lengths).
 
-用法：
-    python -m spice_pre.data.dataset --config configs/pretrain.yaml build   # 生成 TFRecord
-    python -m spice_pre.data.dataset --config configs/pretrain.yaml stats   # 查看规模
+Usage:
+    python -m spice_pre.data.dataset --config configs/pretrain.yaml build   # Clean and generate TFRecords
+    python -m spice_pre.data.dataset --config configs/pretrain.yaml stats   # Compute dataset statistics
 """
 from __future__ import annotations
 
@@ -34,10 +34,10 @@ from spice_pre.data.preprocessing import (
 
 
 # ---------------------------------------------------------------------------
-# 数据来源解析
+# Data Source Parsing
 # ---------------------------------------------------------------------------
 def _is_colab() -> bool:
-    """是否运行在 Google Colab（代码跑在 Google 云上，官方端点直连即可）。"""
+    """Checks if running in Google Colab (environments have direct access to official huggingface endpoints)."""
     try:
         import google.colab  # noqa: F401
 
@@ -47,16 +47,16 @@ def _is_colab() -> bool:
 
 
 def _set_hf_endpoint(cfg: Config) -> None:
-    """设置 HF 下载端点。
+    """Sets the HuggingFace download endpoint.
 
-    - 本地开发（国内）：用配置里的 hf-mirror.com 镜像。
-    - Colab：虚拟机在 Google 云上，官方 huggingface.co 直连即可；
-      强设国内镜像反而会 LocalEntryNotFoundError。
-      若用户显式设置了 HF_ENDPOINT 环境变量则尊重它。
+    - Local Development (Mainland China): Fallback to the configured hf-mirror.com.
+    - Colab: Executes on Google Cloud, directly connecting to the official huggingface.co;
+      forcing a domestic mirror would instead cause LocalEntryNotFoundError.
+      If the user has explicitly set HF_ENDPOINT as an environment variable, it takes precedence.
 
-    huggingface_hub 只在首次 import 时把 HF_ENDPOINT 读进 constants.ENDPOINT，
-    所以除了设置环境变量外，还要直接改写 constants.ENDPOINT，保证即使库已
-    被 import（如 Jupyter kernel 复用）也能立即生效。
+    huggingface_hub reads HF_ENDPOINT into constants.ENDPOINT only on its first import;
+    therefore, we override constants.ENDPOINT directly in addition to setting the env variable 
+    to guarantee immediate effect even if the library was already imported (e.g. in reused Jupyter kernels).
     """
     if _is_colab():
         endpoint = os.environ.get("HF_ENDPOINT") or "https://huggingface.co"
@@ -72,11 +72,11 @@ def _set_hf_endpoint(cfg: Config) -> None:
 
 
 def list_shards(cfg: Config) -> List[str]:
-    """返回 entries_shard_*.parquet 文件名列表（已排序）。"""
+    """Returns a sorted list of entries_shard_*.parquet filenames."""
     if cfg.data.source == "local":
         pat = os.path.join(cfg.data.local_dir, "entries_shard_*.parquet")
         files = sorted(os.path.basename(p) for p in glob.glob(pat))
-        # 仅保留 entries/atoms 成对存在的 shard
+        # Keep only shards where both entries and atoms exist in pairs
         return [
             f
             for f in files
@@ -95,7 +95,7 @@ def list_shards(cfg: Config) -> List[str]:
 
 
 def resolve_path(cfg: Config, shard_fname: str) -> str:
-    """把 shard 文件名解析成本地路径（local 直接拼，hf 下载到缓存）。"""
+    """Resolves a shard filename to its local file path (concatenated directly for local, downloaded to cache for hf)."""
     if cfg.data.source == "local":
         return os.path.join(cfg.data.local_dir, shard_fname)
     _set_hf_endpoint(cfg)
@@ -110,12 +110,12 @@ def resolve_path(cfg: Config, shard_fname: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 单 shard 清洗 → 三元组
+# Shard-level Cleansing -> Record Tuples
 # ---------------------------------------------------------------------------
 def _records_from_shard(
     entries_path: str, atoms_path: str, cfg: Config
 ) -> List[dict]:
-    """读一个 shard 的 entries + atoms，返回 [(tokens, mask, coords, env)]。"""
+    """Loads a single shard's entries and atoms, returning a list of dicts: [(tokens, mask, coords, env)]."""
     en = pl.read_parquet(entries_path)
     if cfg.data.use_env_filtered:
         en = en.filter(pl.col("has_env"))
@@ -127,15 +127,15 @@ def _records_from_shard(
     if en.height == 0:
         return []
 
-    # 只取 Cα 原子，限定在目标 pdb 集合内
+    # Select only Cα atoms and filter by the target pdb set
     at = pl.read_parquet(atoms_path).filter(pl.col("is_ca"))
     at = at.filter(pl.col("pdb_id").is_in(en["pdb_id"].to_list()))
     at = at.sort(["pdb_id", "chain_id", "res_seq"])
-    # 多构象（NMR）/ 交替构象去重：同一 (chain, res_seq) 取第一条。
-    # ⚠️ polars unique(keep="first") 会按唯一键分组重排，破坏行序！
-    # 必须在其后重新按骨架顺序 (pdb_id, chain_id, res_seq) 排序，
-    # 否则序列↔坐标不对齐（相邻残基 Cα 距离 ~20Å 而非 ~3.8Å），
-    # 模型永远学不出拓扑（曾导致 pre-train 出 blob、CE 卡在均匀基线）。
+    # Deduplicate multiple conformations (NMR) or alternative locations (altloc): keep the first entry per (chain, res_seq).
+    # ⚠️ Polars' `unique(keep="first")` groups and rearranges rows, which disrupts the original residue order!
+    # We must explicitly re-sort by backbone order (pdb_id, chain_id, res_seq) afterward; otherwise, 
+    # sequence tokens and coordinate arrays become misaligned (consecutive Cα distance spikes to ~20Å instead of the physical ~3.8Å), 
+    # preventing the model from learning protein topologies (which previously led pre-training to predict amorphous blobs with CE stuck at uniform baselines).
     at = at.unique(subset=["pdb_id", "chain_id", "res_seq"], keep="first")
     at = at.sort(["pdb_id", "chain_id", "res_seq"])
 
@@ -169,7 +169,7 @@ def _records_from_shard(
 
 
 # ---------------------------------------------------------------------------
-# TFRecord 序列化
+# TFRecord Serialization
 # ---------------------------------------------------------------------------
 def _bytes_feature(value: bytes):
     return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
@@ -193,14 +193,14 @@ def _make_example(rec: dict) -> tf.train.Example:
 
 
 def build_tfrecords(cfg: Config, verbose: bool = True) -> int:
-    """把全部（或部分）shard 清洗后写入 TFRecord。返回记录总数。"""
+    """Cleanses all (or a subset of) shards and serializes them into TFRecords. Returns the total record count."""
     os.makedirs(cfg.data.tfrecord_dir, exist_ok=True)
     shards = list_shards(cfg)
     if cfg.data.max_shards:
         shards = shards[: cfg.data.max_shards]
     if not shards:
         raise FileNotFoundError(
-            f"没有找到 entries shard（source={cfg.data.source}, "
+            f"No entries shards found (source={cfg.data.source}, "
             f"local_dir={cfg.data.local_dir}）"
         )
 
@@ -213,6 +213,14 @@ def build_tfrecords(cfg: Config, verbose: bool = True) -> int:
             if verbose:
                 print(f"[{idx}] {shard_fname}: 0 records, skipped")
             continue
+        # ⚠️ Data efficiency ablation: global sequence chain truncation (max_chains, 0 = unlimited) — strictly limits the dataset to N chains across all shards
+        if cfg.data.max_chains:
+            remain = cfg.data.max_chains - total
+            if remain <= 0:
+                if verbose:
+                    print(f"[{idx}] Reached max_chains={cfg.data.max_chains}, halting serialization")
+                break
+            recs = recs[:remain]
         out_path = os.path.join(cfg.data.tfrecord_dir, f"shard_{idx:04d}.tfrecord")
         with tf.io.TFRecordWriter(out_path) as writer:
             for r in recs:
@@ -226,7 +234,7 @@ def build_tfrecords(cfg: Config, verbose: bool = True) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 读 TFRecord → tf.data.Dataset
+# Deserialization: TFRecord -> tf.data.Dataset
 # ---------------------------------------------------------------------------
 def _parse_example(proto: tf.Tensor, max_seq_len: int):
     feats = {
@@ -251,20 +259,20 @@ def load_tfrecord_dataset(
     split: str = "train",
     shuffle_buffer: int = 4096,
 ) -> tf.data.Dataset:
-    """读取 TFRecord，返回 tf.data.Dataset（未 batch，未 padded）。
+    """Deserializes TFRecords, returning an unbatched, unpadded tf.data.Dataset.
 
-    split="train" / "val"：按 TFRecord 文件名排序后按 val_split 比例切分文件。
+    split="train" / "val": splits shard files based on the configured val_split after sorting filenames.
     """
     files = sorted(glob.glob(os.path.join(cfg.data.tfrecord_dir, "shard_*.tfrecord")))
     if not files:
         raise FileNotFoundError(
-            "没有 TFRecord，请先运行: python -m spice_pre.data.dataset build"
+            "No TFRecord files found; please generate them first using: python -m spice_pre.data.dataset build"
         )
 
     n_files = len(files)
-    # 按 val_split 比例计算验证集文件数（至少 1 个文件），train 取其余文件
+    # Compute the number of validation files based on val_split ratio (at least 1 file), and allocate the remaining files for training
     n_val = max(1, int(round(n_files * cfg.train.val_split)))
-    # 文件太少时保护：保证 train 至少 1 个文件
+    # Edge-case safety guard when very few files exist: guarantees at least 1 file for training
     if n_files <= 1:
         n_val = 0
     elif n_val >= n_files:
@@ -285,7 +293,7 @@ def load_tfrecord_dataset(
 
 
 def count_records(cfg: Config) -> int:
-    """统计 TFRecord 总记录数（用于打印 epoch 步数）。"""
+    """Computes the total number of records across all TFRecords (used to determine epoch steps)."""
     files = glob.glob(os.path.join(cfg.data.tfrecord_dir, "shard_*.tfrecord"))
     if not files:
         return 0
@@ -299,16 +307,16 @@ def count_records(cfg: Config) -> int:
 # ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--config", default=None, help="YAML 配置文件路径")
+    ap.add_argument("--config", default=None, help="Path to YAML configuration file")
     ap.add_argument("--max-shards", type=int, default=None,
-                    help="覆盖 data.max_shards（调试用）")
+                    help="Override data.max_shards (for debugging)")
     ap.add_argument("--structures", type=int, default=None,
-                    help="覆盖 data.structures_per_shard（调试用）")
+                    help="Override data.structures_per_shard (for debugging)")
     ap.add_argument("--keep-env-all", action="store_true",
-                    help="覆盖 use_env_filtered=False（用全部结构+默认环境）")
+                    help="Override and set use_env_filtered=False (loads all structures with default environmental conditions)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("build", help="清洗并生成 TFRecord")
-    sub.add_parser("stats", help="统计 TFRecord 规模")
+    sub.add_parser("build", help="Clean and serialize shards into TFRecords")
+    sub.add_parser("stats", help="Print total record count in TFRecords")
     args = ap.parse_args()
 
     cfg = load_config(args.config)

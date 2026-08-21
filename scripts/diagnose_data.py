@@ -1,17 +1,3 @@
-"""数据管线健全性诊断（本地/Colab 均可跑）。
-
-目标：回答"blob 是不是数据管线的锅"。
-对每个 TFRecord 样本计算：
-  - 序列健康度：UNK/X 占比（res_name 重建失败会大量出现 X）
-  - 结构紧凑度：Rg（与长度关系）
-  - 接触密度：Cα-Cα < 8Å 的残基对占比（有折叠的蛋白明显高）
-  - 局部 vs 长程接触：|i-j|<=4 与 |i-j|>=12 的接触占比
-      （折叠蛋白会有可观的长程接触；纯随机链几乎只有局部接触）
-
-用法：
-    python -m scripts.diagnose_data            # 默认读 data/tfrecords 下所有 shard
-    python -m scripts.diagnose_data --max 200  # 只看前 200 条
-"""
 from __future__ import annotations
 
 import argparse
@@ -21,7 +7,7 @@ import os
 import numpy as np
 import tensorflow as tf
 
-CONTACT_CUTOFF = 8.0   # Å，Cα 接触阈值
+CONTACT_CUTOFF = 8.0   
 
 
 def _parse_example(proto: tf.Tensor):
@@ -39,7 +25,6 @@ def _parse_example(proto: tf.Tensor):
 
 
 def sample_stats(tokens, coords):
-    """返回一个样本的指标 dict。"""
     L = len(tokens)
     if L < 2:
         return None
@@ -47,7 +32,6 @@ def sample_stats(tokens, coords):
     center = c - c.mean(axis=0)
     rg = float(np.sqrt(np.mean(np.sum(center ** 2, axis=-1))))
 
-    # 接触矩阵（欧氏距离）
     d2 = np.sum((c[:, None, :] - c[None, :, :]) ** 2, axis=-1)
     iu = np.triu_indices(L, k=1)
     dists = np.sqrt(d2[iu])
@@ -57,14 +41,11 @@ def sample_stats(tokens, coords):
     n_pairs = len(dists)
     contact_density = float(contact.mean()) if n_pairs else 0.0
 
-    # 局部 vs 长程接触（只看存在的接触）
     local = contact & (seq_gap <= 4)
     longr = contact & (seq_gap >= 12)
     local_frac = float(local.sum() / max(contact.sum(), 1))
     longr_frac = float(longr.sum() / max(contact.sum(), 1))
 
-    # 相邻残基 Cα 间距：真肽键连接 Cα(i)-Cα(i+1)≈3.8Å（3.3~4.3 内）
-    # 若顺序被打乱（排序/重建 bug），i,i+1 间距会是随机值 → 该比例骤降
     if L >= 2:
         adj = np.sqrt(np.sum((c[1:] - c[:-1]) ** 2, axis=-1))
         adj_frac = float(np.mean((adj >= 3.3) & (adj <= 4.3)))
@@ -72,7 +53,7 @@ def sample_stats(tokens, coords):
     else:
         adj_frac, adj_med = 0.0, 0.0
 
-    unk_frac = float((tokens == 21).mean())  # UNK_IDX
+    unk_frac = float((tokens == 21).mean())  
     return {
         "L": L,
         "rg": rg,
@@ -140,7 +121,6 @@ def main() -> int:
     row("相邻Cα 中位间距", ams)
     row("UNK 占比", uks)
 
-    # 判读
     print("\n===== 判读 =====")
     print(f"UNK 中位数 {np.median(uks)*100:.1f}%  "
           f"({'⚠️ 序列重建有损' if np.median(uks) > 0.05 else '✅ 序列干净'})")

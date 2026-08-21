@@ -1,21 +1,3 @@
-"""全局 Replay Buffer（容量可配，默认 1e6，跨序列共享）。
-
-每个 transition（定制 2/5 混合动作 + 分层掩码）：
-    z            [D]          序列-环境嵌入（mean-pool）
-    env          [3]          当前环境 (ph, T, ionic) 归一化
-    M            [5]          五维物理指标
-    u_hist       [W]          最近 W 步势能历史（Critic 特权输入）
-    action_cont  [cont]       连续动作（偏置力[16]+环境偏移[2]）
-    action_disc  [L_max+20]   离散突变 soft one-hot（位置 + 氨基酸）
-    mutation_mask[1]          分层动作：该步是否允许突变
-    z_mask       [L_max]      序列掩码（离散头 position 分布用，float16 省内存）
-    reward       [1]
-    next_z/next_env/next_M/next_u_hist   下一状态
-    done         [1]
-
-内存提示：容量 × 单条字节数（≈1.1k float32，L_max=256 时）≈ 4.4GB/1e6 条，
-可按需调小 buffer_capacity。
-"""
 from __future__ import annotations
 
 import numpy as np
@@ -55,16 +37,18 @@ class ReplayBuffer:
         i = self.ptr
         self.z[i] = tr["z"]
         self.env[i] = tr["env"]
-        self.M[i] = tr["M"]
+        # 2026-08-17 Safeguard: Clip physical indicators to [-5.0, 5.0] in Replay Buffer
+        self.M[i] = np.clip(tr["M"], -5.0, 5.0)
         self.u_hist[i] = tr["u_hist"]
         self.action_cont[i] = tr["action_cont"]
         self.action_disc[i] = tr["action_disc"]
         self.mutation_mask[i, 0] = 1.0 if tr.get("mutation_mask", 1) else 0.0
         self.z_mask[i] = tr["z_mask"]
-        self.reward[i, 0] = tr["reward"]
+        # 2026-08-17 Safeguard: Clip reward to [-150.0, 15.0] to protect against high energy spikes while keeping crash penalty intact
+        self.reward[i, 0] = np.clip(tr["reward"], -150.0, 15.0)
         self.next_z[i] = tr["next_z"]
         self.next_env[i] = tr["next_env"]
-        self.next_M[i] = tr["next_M"]
+        self.next_M[i] = np.clip(tr["next_M"], -5.0, 5.0)
         self.next_u_hist[i] = tr["next_u_hist"]
         self.done[i, 0] = 1.0 if tr["done"] else 0.0
         self.ptr = (i + 1) % self.capacity

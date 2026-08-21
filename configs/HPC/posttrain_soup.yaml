@@ -1,0 +1,119 @@
+# ===== 原始汤 RL（n=0 纯物理版）：随机序列种子 + 随机模型权重 + 纯 MD 物理 =====
+# 与 posttrain.yaml 唯一差异：① pretrain_ckpt 指向不存在路径 → train_post 跳过加载 → 模型随机初始化（n=0）
+#   ⚠️ 关键：不用任何 n（10/100/1000/45000）的折叠先验权重，避免"物理指引"被"数据学到的折叠语法"污染。
+#   ② conservation_mask=false：保守位点屏蔽是数据先验，纯物理关掉。
+#   ③ 输出目录隔离到 soup_rl/，不覆盖 n45000 产物。
+# 用途：run_soup_rl.sbatch -- POST_CONFIG=configs/HPC/posttrain_soup.yaml
+# 验证加载：跑的时候 .out 不应有"已加载 Pre-train 权重"（随机初始化即对）。
+
+env:
+  env_abs_window: true
+  env_dT_clamp: 20.0
+  env_dph_clamp: 2.0
+  env_offset_clamp: true
+  env_offset_dim: 2
+  env_ph_max: 10.0
+  env_ph_min: 2.0            # ⚠️ 别抬到 5：会封死 pH2 崩溃域，路径 A 触不到 env_fail → 突变永不触发
+  env_temp_max: 330.0
+  env_temp_min: 260.0
+  episode_max_steps: 20
+  force_clamp: 0.5
+  force_dim: 16
+  ionic_default: 0.0
+  metric_dim: 5
+  mutation_every: 20
+  ph_max: 14.0
+  ph_min: 0.0
+  ph_rebuild_threshold: 0.05
+  pressure: 1.0
+  relax_iters: 50
+  reward_ref: 100000
+  strict_incomplete: true
+  temp_max: 400.0
+  temp_min: 150.0
+  tolerance: 2.0
+  u_window: 10
+
+es:
+  conservation_external: ''
+  conservation_mask: false      # ⚠️ n=0 纯物理：数据先验（保守位点屏蔽）关掉
+  conservation_threshold: 0.8
+  crossover_rate: 0.5
+  elites: 4
+  fitness_survive_steps: 20
+  freeze_backbone: true
+  generations: 50
+  head_b_noise: 0.05
+  head_c_noise: 0.05
+  mutation_rate: 0.1
+  n_mutations_per_candidate:
+  - 1
+  - 3
+  population: 8
+  q_gate: 0.5
+
+post:
+  anchor_ph: 7.0
+  anchor_temp: 298.0
+  ckpt_dir: ../data/data_efficiency/soup_rl/checkpoints/posttrain
+  ckpt_every: 10
+  conf_batch: 16
+  conf_lr: 0.0001
+  conf_train_interval: 10
+  env_delta_T: 5.0
+  env_delta_ph: 5          # ⚠️ 必须够大才能让路径 A 触到崩溃 flank(pH2/10)；=2 时全程稳定 → 零突变空转
+  finetune_batch_size: 16
+  finetune_epochs: 1
+  finetune_lr: 0.0001
+  finetune_out: checkpoints/pretrain/finetuned.weights.h5
+  log_dir: ../data/data_efficiency/soup_rl/runs/posttrain
+  log_every: 10
+  max_episodes: 40
+  max_seq_len: 150
+  min_seq_len: 70
+  no_survivor_abort: 15
+  escape_step_threshold: 5
+  escape_after: 3
+  recovery_episodes: 4
+  recovery_delta_ph: 1.0
+  recovery_delta_T: 5.0
+  nan_watchdog: true
+  path_a_threads: 2
+  phase_map_dir: ../data/data_efficiency/soup_rl/phase_maps
+  phase_map_interval: 0
+  phase_map_ph_range:
+  - 2.0
+  - 11.0
+  - 1.0
+  phase_map_temp_range:
+  - 250.0
+  - 350.0
+  - 10.0
+  pretrain_ckpt: checkpoints/pretrain/NONE_soup   # ⚠️ 不存在 → train_post 跳过加载 → 随机初始化（n=0 纯物理）
+  pretrain_config: configs/pretrain.yaml
+  pretrain_tfrecord_dir: data/tfrecords
+  pseudo_label_dir: ../data/data_efficiency/soup_rl/pseudo_labels
+  pseudo_tfrecord_path: ../data/data_efficiency/soup_rl/pseudo.tfrecord
+  pseudo_weight_repeat: 8
+  quick_check_steps: 20
+
+sac:
+  aa_dim: 20
+  trace_layers: false
+  eager_update: false
+  batch_size: 32
+  buffer_capacity: 300000
+  discrete_position_dim: 256
+  enable_mutation_head: true
+  gamma: 0.99
+  gumbel_tau: 1.0
+  hidden_dim: 256
+  lr_actor: 0.0003
+  lr_alpha: 0.0003
+  lr_critic: 0.0003
+  mutation_every: 20
+  target_entropy_factor: 0.5
+  tau: 0.005
+  track_mutation_mask: true
+  u_ref: 100000
+  update_every_steps: 20

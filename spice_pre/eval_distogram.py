@@ -1,13 +1,3 @@
-"""评估 Pre-train 是否学到拓扑：从预测 distogram 用经典 MDS 重建坐标，Kabsch 对齐后算 RMSD。
-
-「学到拓扑」判据：MDS-RMSD 显著低于回旋半径 Rg（~20Å）。若 ~10Å 以下说明抓到二级结构/粗略拓扑，
-RL 只需局部微调；若 ~Rg 则是"紧凑 blob"（没学到折叠）。
-
-用法（Colab，需已训练出 best_weights.weights.h5）：
-    python -m spice_pre.eval_distogram --config configs/pretrain.yaml --samples 16
-
-输出：每个样本 len / true_Rg / mds_rmsd（从预测距离重建）/ 以及全样本平均。
-"""
 from __future__ import annotations
 
 import argparse
@@ -23,7 +13,6 @@ from spice_pre.models import SPICEPretrainModel
 
 
 def mds_reconstruct(d: np.ndarray) -> np.ndarray:
-    """经典 MDS：距离矩阵 [L,L] -> 坐标 [L,3]（numpy）。"""
     n = d.shape[0]
     d2 = d.astype(np.float64) ** 2
     row = d2.mean(1, keepdims=True)
@@ -67,7 +56,7 @@ def main() -> int:
     model.load_weights(args.weights)
 
     mds_rmsds = []
-    print(f"[eval] 预测距离 -> MDS 重建 -> Kabsch RMSD（前 {args.samples} 个 val 样本）:")
+    print(f"[eval] Predicted distances -> MDS rebuild -> Kabsch RMSD (first {args.samples} val samples):")
     ds = load_tfrecord_dataset(cfg, "val").take(args.samples)
     for i, (x, y) in enumerate(ds):
         n = int(tf.reduce_sum(x["mask"]).numpy())
@@ -90,8 +79,8 @@ def main() -> int:
         print(f"  s{i}: L={n:>4d} | true_Rg={true_rg:7.3f} | MDS-RMSD={r:7.3f} Å")
 
     if mds_rmsds:
-        print(f"\n[eval] 平均 MDS-RMSD = {np.mean(mds_rmsds):.3f} Å")
-        print("  ~10Å 以下 → 学到拓扑（二级结构/粗略折叠）✅ |  ~Rg(~20Å) → 仍是紧凑 blob ❌")
+        print(f"\n[eval] Mean MDS-RMSD = {np.mean(mds_rmsds):.3f} A")
+        print("  <~10 A -> topology learned (secondary/coarse fold) | ~Rg (~20 A) -> still a compact blob")
     return 0
 
 

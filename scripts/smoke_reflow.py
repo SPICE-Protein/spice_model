@@ -1,11 +1,4 @@
 #!/usr/bin/env python
-"""Pseudo-label feedback pipeline smoke test (no engine run).
-
-Create a few pseudo-label npz -> load -> write_pseudo_tfrecord -> merge with
-Pre-train TFRecords -> padded batch is readable. Validates the stage-4 data loop.
-
-Usage: PYTHONPATH=. python scripts/smoke_reflow.py
-"""
 import os
 import sys
 
@@ -25,7 +18,6 @@ cfg = load_config("configs/posttrain.yaml")
 AA = "ACDEFGHIKLMNPQRSTVWY"
 rng = np.random.default_rng(0)
 
-# Create a few pseudo-labels
 pseudo_dir = cfg.post.pseudo_label_dir
 os.makedirs(pseudo_dir, exist_ok=True)
 for i, steps in enumerate([200, 150, 80]):
@@ -43,7 +35,6 @@ n = write_pseudo_tfrecord(pseudo_dir, cfg.post.pseudo_tfrecord_path, 512,
                           weight_repeat=8, survive_steps=200)
 print("write_pseudo_tfrecord ->", n, "entries (weighted repeat)")
 
-# Merge Pre-train TFRecords + pseudo-labels
 ds = make_finetune_dataset(cfg, cfg.post.pseudo_tfrecord_path, 512)
 padded_shapes = ({"tokens": [None], "mask": [None], "env": [3], "coords": [None, 3]}, [None, 3])
 pad_values = ({"tokens": 0, "mask": 0.0, "env": 0.0, "coords": 0.0}, 0.0)

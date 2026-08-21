@@ -1,0 +1,114 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+# ============================================================================
+# SPICE Custom Container (built from scratch): bypasses buggy MKL TF (where batch_size > 1 matmul is miscalculated, confirmed by smoke Check 6).
+# Starts from a clean ubuntu:22.04 (glibc 2.35) base, packing an independent miniconda (/opt/conda), Python 3.12,
+# and TensorFlow to decouple from the host's buggy environment. Replicates the local spice env (py3.12 + numpy 2.5.2 + TF 2.21 + keras 3.15)
+# to guarantee ABI compatibility for cp312 engine wheels.
+# Features a built-in matmul gate: automatically falls back from buggy TF 2.21 to TF 2.18/2.19 (using legacy oneDNN) at build time.
+#
+# Build:  bash scripts/experiments/slurm/build_spice_container.sh
+# Usage:  CONDA_SH=/opt/conda/etc/profile.d/conda.sh \
+#         SIF=$HOME/spice/spice-tf.sif \
+#         bash scripts/experiments/slurm/smoke_6qqe_login.sh            # smoke/gate testing
+#         CONDA_SH=/opt/conda/etc/profile.d/conda.sh SIF=$HOME/spice/spice-tf.sif \
+#         bash scripts/experiments/slurm/run_45000.sbatch               # formal RL run
+# ============================================================================
+
+%arguments
+    # Mirror strategy: "tuna" (Tsinghua mirror for local HPC builds in China) / "official" (Official repositories for Sylabs cloud builds,
+    # as cloud servers are located overseas where TUNA downloads can be extremely slow). Override using --build-arg MIRROR=official at build time.
+    MIRROR=tuna
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ---- 0) apt / pip / miniconda Mirror Configuration ----
+    if [ "$MIRROR" = "official" ]; then
+        echo "== Using official sources (remote cloud build) =="
+        PIP_INDEX="https://pypi.org/simple"
+        MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-py310_25.7.0-2-Linux-x86_64.sh"
+    else
+        echo "== Using Tsinghua TUNA mirror (local HPC build) =="
+        sed -i 's@//.*archive.ubuntu.com@//mirrors.tuna.tsinghua.edu.cn@g; s@//security.ubuntu.com@//mirrors.tuna.tsinghua.edu.cn@g' /etc/apt/sources.list || true
+        PIP_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"
+        MINICONDA_URL="https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-py310_25.7.0-2-Linux-x86_64.sh"
+    fi
+    apt-get update -y
+    apt-get install -y --no-install-recommends wget ca-certificates
+
+    curl -f -C - -o se.whl https://ksefile.hpccube.com:65241/efile/s/d/cmVkZWxlY3RyaWNpdHk=/3f95899ee4fb81d2
+
+    # ---- 1) Container-isolated Miniconda (/opt/conda, decoupled from host shared HOME) ----
+    export MINICONDA=/opt/conda
+    export PATH="$MINICONDA/bin:$PATH"
+    ( wget -q --no-check-certificate "$MINICONDA_URL" -O /tmp/mc.sh \
+      || { [ "$MIRROR" = "official" ] && { echo "[error] Miniconda download failed"; exit 1; }; \
+           wget -q --no-check-certificate https://repo.anaconda.com/miniconda/Miniconda3-py310_25.7.0-2-Linux-x86_64.sh -O /tmp/mc.sh; } ) \
+      || { echo "[error] Miniconda download failed (check connection to TUNA/Anaconda)"; exit 1; }
+    bash /tmp/mc.sh -b -f -p "$MINICONDA"
+    conda create -y -n spice python=3.12
+    PYBIN="$MINICONDA/envs/spice/bin/python"
+    $PYBIN -m pip config set global.index-url "$PIP_INDEX" || true
+    [ "$MIRROR" = "official" ] || $PYBIN -m pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn || true
+
+    # ---- 2) Dependencies (install numpy first — engine wheel ABI validated against numpy 2.5.2 / py3.12) ----
+    $PYBIN -m pip install --only-binary=:all: --no-cache-dir numpy==2.5.2
+    [ -f /opt/spice_engine.whl ] && $PYBIN -m pip install --no-deps /opt/spice_engine.whl
+    $PYBIN -m pip install --no-cache-dir pyyaml pyarrow polars scipy tensorboard matplotlib
+
+    # ---- 3) Matmul Gate (= smoke Check 6 logic, validated directly at build time) ----
+    matmul_gate() {
+      $PYBIN - <<'PY'
+import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+import numpy as np, tensorflow as tf
+rng = np.random.default_rng(7)
+ok = True
+for shape, units in [([32,256],256),([32,256],18),([32,289],256),([1,259],256)]:
+    x = rng.normal(0, 1.0, shape).astype(np.float32)
+    d = tf.keras.layers.Dense(units); d(x)
+    ye = d(x).numpy()
+    d2 = tf.keras.layers.Dense(units); d2(x); d2.set_weights(d.get_weights())
+    yg = tf.function(lambda xx: d2(xx))(x).numpy()
+    diff = float(np.max(np.abs(ye - yg)))
+    ae = float(np.max(np.abs(ye))); ag = float(np.max(np.abs(yg)))
+    good = (np.all(np.isfinite(ye)) and np.all(np.isfinite(yg))
+            and diff < 1e-2 * max(1.0, ae) and ae < 100 and ag < 100)
+    print(f"  {shape}->{units}: eager={ae:.3f} graph={ag:.3f} diff={diff:.2e} {'OK' if good else 'FAIL'}")
+    ok = ok and good
+import sys
+sys.exit(0 if ok else 1)
+PY
+    }
+
+    echo "== Attempting TF 2.21 =="
+    if ! $PYBIN -m pip install --only-binary=:all: --no-cache-dir "tensorflow==2.21"; then
+        echo "[error] TF 2.21 installation failed"; exit 1
+    fi
+    if matmul_gate; then
+        echo "[ok] TF 2.21 matmul passes -> locked to 2.21"
+    else
+        echo "[warn] TF 2.21 matmul is buggy -> falling back to TF 2.18 (legacy oneDNN)"
+        $PYBIN -m pip install --only-binary=:all: --no-cache-dir "tensorflow==2.18" "numpy==2.2.6"
+        if ! matmul_gate; then
+            echo "[error] TF 2.18 is also buggy -> issue resides in host base image/CPU, terminating"
+            exit 1
+        fi
+        echo "[ok] TF 2.18 matmul passes -> locked to 2.18"
+    fi
+
+%environment
+    export PATH=/opt/conda/envs/spice/bin:$PATH
+    export CUDA_VISIBLE_DEVICES=""
+    export TF_ENABLE_ONEDNN_OPTS=0
+    export ONEDNN_DEFAULT_FPMATH_MODE=FP32
+    export OMP_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    exec /opt/conda/envs/spice/bin/python "$@"

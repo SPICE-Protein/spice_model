@@ -1,12 +1,3 @@
-"""检查 atoms parquet 里残基顺序是否沿肽链骨架。
-
-打印几个结构的前 30 个 (chain_id, res_seq, res_name) 及相邻 Cα 距离。
-若顺序正确，相邻距离应 ~3.8Å；若被打乱，会出现大间距。
-同时统计每个结构有多少条链（链合并可能是乱序来源）。
-
-用法：
-    python -m scripts.inspect_chain_order [--shard 0000] [--npdb 3]
-"""
 from __future__ import annotations
 
 import argparse
@@ -28,7 +19,6 @@ def main() -> int:
     entries_f = f"entries_shard_{args.shard}.parquet"
     atoms_f = f"atoms_shard_{args.shard}.parquet"
 
-    # 通过 config 的端点下载/解析（本地走 hf-mirror）
     ep = resolve_path(cfg, entries_f)
     apath = resolve_path(cfg, atoms_f)
     print(f"entries: {ep}\natoms:   {apath}")
@@ -54,7 +44,6 @@ def main() -> int:
                 d = float(((r["x"] - px) ** 2 + (r["y"] - py) ** 2 + (r["z"] - pz) ** 2) ** 0.5)
                 line += f"| ΔCA={d:6.2f}Å"
             print(line)
-        # 相邻距离统计
         c = sub.select(["x", "y", "z"]).to_numpy().astype(float)
         adj = ((c[1:] - c[:-1]) ** 2).sum(axis=1) ** 0.5
         import numpy as np

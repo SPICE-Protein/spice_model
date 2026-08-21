@@ -1,8 +1,4 @@
 #!/usr/bin/env python
-"""Lightweight RL smoke test (no engine; validates TF networks / buffer / SAC).
-
-Usage: python scripts/smoke_rl.py
-"""
 import os
 import sys
 
@@ -64,7 +60,6 @@ a_cont, a_disc = sac.act(
 )
 print("act shapes:", a_cont.shape, a_disc.shape)
 
-# Build ES model + load pre-train weights (no engine run)
 from spice_rl.train_post import build_rl_model, cfg_sac_z_dim  # noqa: E402
 
 model = build_rl_model(cfg)
@@ -75,7 +70,17 @@ from spice_rl.es import ESEvolver  # noqa: E402
 es = ESEvolver(model, cfg.es)
 print("ESEvolver ok; evolvable vars (Head-B/C + policy):", len(es.head_vars))
 
-# Head D dual-path confidence supervision (no engine run)
+from spice_rl.train_post import encode_z, tokens_from_seq  # noqa: E402
+
+_tk, _mk = tokens_from_seq("MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ", L)
+_z = encode_z(model, _tk, np.array([0.5, 0.5, 0.5], np.float32), _mk)
+assert _z.shape == (256,), _z.shape
+_c = es.propose_mutations(
+    "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ", _tk,
+    np.array([0.5, 0.5, 0.5], np.float32), _mk,
+)
+print("masked z-pool ok:", _z.shape, "| ES candidates:", len(_c))
+
 from spice_rl.confidence import ConfidenceHeadTrainer  # noqa: E402
 
 ct = ConfidenceHeadTrainer(model, lr=1e-4)

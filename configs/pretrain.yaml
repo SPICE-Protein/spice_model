@@ -7,9 +7,9 @@ data:
   cache_dir: data/cache
   local_dir: data/parquet
   tfrecord_dir: data/tfrecords
-  use_env_filtered: false  # 用满全量（~4.5w）：有环境参数的保留真实 env，缺的 normalize_env 填默认值；预训练要数据量
+  use_env_filtered: false  # Use full volume (~45k): retains real environments where environmental parameters exist, uses normalize_env defaults otherwise; pre-training requires large data volumes
   min_seq_len: 40          # filter out fragments that are too short
-  max_seq_len: 512         # length cap (padding length during training)
+  max_seq_len: 512         # Full data sequence limit (including long chains 200-400aa which account for 65%): distogram trains on all chains, long-chain coordinates are gated via coord_max_len (no data discarded)
   max_shards: 0            # 0 = all shards (set 1-2 for debugging)
   structures_per_shard: 0  # 0 = all structures per shard (debug: set a few hundred)
 
@@ -22,13 +22,18 @@ model:
   dropout: 0.1
   env_dim: 3         # normalized [pH, T, ionic strength]
   pos_max_len: 1024  # positional encoding cap
-  dist_bins: 24      # binned distogram 距离分箱数（64 箱方案内存不够，折中 24）
-  dist_dim: 64       # distogram 头投影维度
-  dist_min: 3.0      # distogram 最小距离（Å）
-  dist_max: 48.0     # distogram 最大距离（Å），超出落溢出 bin
+  dist_bins: 48      # Binned distogram distance bins (24 -> 48: finer-grained bins -> more accurate coordinate reconstruction/geometry; Kaggle T4 VRAM is sufficient)
+  dist_dim: 32       # Distogram head projection dimension (64 -> 32: halves bilinear einsum FLOPs, accelerating all length buckets uniformly with negligible impact on precision)
+  dist_min: 3.0      # distogram minimum distance (Å)
+  dist_max: 48.0     # distogram maximum distance (Å), values exceeding this fall into overflow bin
+  distogram_fp16: true  # Run distogram bilinear einsum in fp16 (achieves ~8x speedup on T4 tensor cores; cross-entropy remains in fp32 with clamp safeguards)
+                        # ✅ Safe: E combination (fp32 model + fp16 einsum) verified locally to converge chains to 2.3 Å; only "pure fp16 models" lock/freeze
+  frame_recycle_steps: 2   # 🔴 Recycling refinement rounds: mitigates frame head cumsum long-chain error accumulation (via distance-aware SE(3)-equivariant iterative correction)
+  frame_refine_dim: 64     # Refinement module attention/MLP hidden dimension
+  frame_refine_heads: 4    # Refinement attention heads
 
 train:
-  batch_size: 96         # 64→96 with mixed_float16 (fp16 激活省一半内存)；最长 512 桶仍自动降 16-32；若 OOM 退回 64
+  batch_size: 96         # 64->96 with mixed_float16 (fp16 activation saves half the memory); longest 512 bucket is automatically reduced to 16-32; fall back to 64 if OOM occurs
   epochs: 30
   lr: 1.0e-3           # after collapse is broken lr is an effective lever; raised 3e-4 -> 1e-3 (3x)
   weight_decay: 1.0e-4
@@ -41,10 +46,28 @@ train:
   log_every: 50
   ckpt_every: 1000
   max_steps: 0       # 0 = run all epochs
-  cache_train: true  # pre-cache an epoch's batches in RAM so the pipeline never stalls compute (first pass slow, then pure RAM)
-  dist_weight: 1.0   # binned distogram CE 权重（主目标）
-  pair_weight: 0.05  # 0.3→0.05：坐标头 rmsd 乱跳(17-28Å)的噪声梯度干扰 CE 学习，下调让 CE 主导
-  use_gpu: true      # true = 用 GPU（若有）；false = 强制只用 CPU
-  gpu_mem_growth: true  # 显存按需增长
-  gpu_devices: ""    # 指定 GPU 编号白名单，如 "0" / "0,1"；空 = 全部
-  use_mixed_precision: true   # FP32→fp16 混合精度：T4 上 ~2-4x 提速。distogram 头/Kabsch 已强制 fp32，loss-scale + clip-scale 已在 train_step 处理
+  cache_train: true  # pre-cache an epoch's batches so the pipeline never stalls compute (first pass slow, then pure RAM)
+  cache_path: data/train_cache  # Non-empty = cache to disk (serializes during 1st epoch, reads cached files thereafter; RAM is not bloated, preventing Kaggle RAM OOM); delete and rebuild if batching or bucketing changes
+  dist_weight: 1.0   # binned distogram CE weight (primary objective)
+  pair_weight: 1.0   # Frame structure head Kabsch weight (0.05 -> 1.0: frame head geometric losses are no longer noisy and can be scaled up; main coordinate supervision)
+  pair_warmup_steps: 3000  # Linearly scale pair_weight from 0 to 1.0 during first 3000 steps (CE learns distance maps first before coordinate supervision begins, preventing optimization imbalance)
+  frame_chirality_weight: 1.0  # Chirality supervision (enforces L-amino acid right-handed backbone topology, preventing mirror structures)
+  frame_clash_weight: 3.0      # Non-adjacent Cα < 3.5 Å clash penalty (mitigates steric clashes/self-intersection); 1.0 is too weak (overwhelmed by Kabsch/consistency/CE; Head A empirically retained ~100 pairs < 3.5 Å clashing, making all-atom builds fail) -> raised to 3.0 on 2026-08-14
+  frame_consistency_weight: 0.5  # Coordinate-distogram self-consistency (applied to all chains including long ones, no native labels required; 1.0 caused validation AUC -0.023 -> reduced to 0.5 for balance)
+  coord_max_len: 200           # 🔴 Length Gating (decisive fix, 2026-08-13): restricts frame coordinate loss to chains <= 200aa.
+  plateau_patience: 5          # 🛑 Plateau detection: val_dist fails to improve significantly for N epochs -> logs manual halt notification
+  plateau_min_delta: 0.005     # Relative improvement threshold (0.5%): improvements below this are counted as "no change"
+  plateau_auto_stop: false     # true = early stopping automatically triggered; false = only logs plateau warning (manually stop on seeing 🛑 [PLATEAU])
+                               #    Long chains (200-400aa, 65% of dataset) suffer cumsum error accumulation -> coordinates diverge -> poisons encoder -> starves distogram CE.
+                               #    Distogram is trained on all sequence lengths (long-chain distances are learnable, verified); coordinate supervision is restricted to short chains; 0 = no gating
+  use_gpu: true      # true = use GPU (if available); false = force CPU only
+  gpu_mem_growth: true  # Allow VRAM growth on demand
+  gpu_devices: "0"    # ⚠️ Conflict between on-disk cache + MirroredStrategy (creates full batch per GPU and repeats reads -> doubles per-GPU batch size + duplicates data)
+                      # Small models do not benefit enough from 2-GPU Sync; single-GPU is most stable. Multi-GPU requires data-sharding refactoring (currently unsupported)
+  use_mixed_precision: false  # 🔴 Must be false (decisive experiment, 2026-08-13): mixed precision (fp16) causes the model optimization to "freeze"
+                              #   - Gradients underflow to 0 in deep fp16 backpropagation (grad_norm=0, halting both CE and coordinate optimization;
+                              #     30 epochs finished with rmsd stuck at 150-195 Å and distogram CE stuck at 5.2).
+                              #   - Fix = E combination: keep model completely in fp32 + set distogram_fp16 = true (bilinear einsum runs on tensor cores;
+                              #     local single-protein validation shows 54.8 Å -> 2.3 Å convergence; fp16 einsum itself is numerically safe).
+                              #   - Speed: fp32 encoder is ~2x slower than fp16, but distogram O(L^2 * bins) still leverages T4 Tensor Cores; net speed is 1.5-2x slower, but correctness is prioritized
+
