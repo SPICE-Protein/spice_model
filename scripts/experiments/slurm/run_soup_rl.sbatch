@@ -1,13 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=soup_rl
-#SBATCH --partition=<PARTITION>        # ← check via sinfo -s, use same partition as other RL runs
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
-#SBATCH --time=24:00:00
-#SBATCH --output=slurm_logs/soup_rl_%A.out
-#SBATCH --error=slurm_logs/soup_rl_%A.err
-
 #SBATCH --partition=<PARTITION>        # ← sinfo -s to check, use the same partition as RL jobs
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4

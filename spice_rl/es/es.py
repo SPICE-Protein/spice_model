@@ -43,6 +43,12 @@ class ESEvolver:
         self.base_shapes = [v.shape.as_list() for v in self.head_vars]
         self.rng = np.random.default_rng(seed)
         self.noise = None
+        # 突变字母表限制（2026-08-22）：默认 full20；配显式字符串（如 "GAVDESPTRK"）则
+        # 突变只许引入这些 aa —— 用于"前生物字母表内演化"的对照实验
+        _alpha = getattr(self.cfg, "mutation_alphabet", "full20")
+        self.aa_allowed = None if (not _alpha or _alpha == "full20") else [
+            i for i, aa in enumerate(AA20) if aa in _alpha
+        ]
 
     def _init_population(self):
         pop = []
@@ -127,7 +133,11 @@ class ESEvolver:
             pos = pos[:n_mut]
         for p in pos:
             lp = np.asarray(logits[p], dtype=np.float64)
-            if not np.all(np.isfinite(lp)):
+            if self.aa_allowed is not None:
+                _amask = np.zeros(lp.shape, bool)
+                _amask[self.aa_allowed] = True
+                lp = np.where(_amask, lp, -np.inf)  # 屏蔽不允许的 aa（softmax 后概率=0）
+            if not np.any(np.isfinite(lp)):
                 continue
             probs = np.exp(lp - lp.max())
             probs = probs / probs.sum()

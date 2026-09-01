@@ -15,9 +15,98 @@ def _engine():
     return spice_engine
 
 
+def _parse_mmcif_atoms(path: str):
+    """纯 python 解析 _atom_site loop → (names, elements, res_seq, res_names, coords float32)。
+    忽略 # 行以兼容：标准文件（# 在数据后）与自产旧文件（# 在列头和数据之间）。"""
+    cols: list[str] = []
+    rows: list[list[str]] = []
+    in_atom = False
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if not s or s == "#":
+                continue  # 空行与 # 忽略：标准文件在数据后、自产旧文件在列头和数据之间
+            if s.startswith("loop_"):
+                in_atom = False
+            elif s.startswith("_atom_site."):
+                if not in_atom:
+                    cols, in_atom = [], True
+                cols.append(s)
+            elif s.startswith("_"):
+                in_atom = False
+            elif in_atom:
+                rows.append(s.split())
+    if not cols:
+        raise ValueError(f"mmCIF has no _atom_site loop: {path}")
+    col_idx = {name: i for i, name in enumerate(cols)}
+
+    def gi(row: list[str], name: str):
+        i = col_idx.get(name)
+        if i is None or i >= len(row):
+            return None
+        return row[i]
+
+    names, elems, resseq, resnm, coords = [], [], [], [], []
+    for r in rows:
+        if gi(r, "_atom_site.group_PDB") != "ATOM":
+            continue
+        nm = gi(r, "_atom_site.label_atom_id")
+        el = gi(r, "_atom_site.type_symbol")
+        rn = gi(r, "_atom_site.label_comp_id")
+        rs = gi(r, "_atom_site.label_seq_id")
+        xyz = [gi(r, f"_atom_site.Cartn_{c}") for c in ("x", "y", "z")]
+        if None in (nm, el, rn, rs, *xyz):
+            continue
+        try:
+            rs_i = int(rs)
+            xyz_f = [float(v) for v in xyz]
+        except (TypeError, ValueError):
+            continue
+        names.append(nm)
+        elems.append(el)
+        resseq.append(rs_i)
+        resnm.append(rn)
+        coords.append(xyz_f)
+    if not names:
+        raise ValueError(f"no ATOM rows parsed from mmCIF: {path}")
+    return names, elems, resseq, resnm, np.asarray(coords, dtype=np.float32)
+
+
+def base_atoms_from_mmcif(path: str) -> dict:
+    """从 mmCIF 直接构造 base_atoms（路径 B 突变重建所需），与 load_structure_with_atoms
+    的返回格式一致：{atom_names, elements, res_seq, res_names, coords float32[N,3]}。
+    引擎 Structure 不暴露原子数组，故必须从源文件重解析（纯 python，含兜底解析）。"""
+    names, elems, resseq, resnm, coords = _parse_mmcif_atoms(path)
+    return {
+        "atom_names": names,
+        "elements": elems,
+        "res_seq": resseq,
+        "res_names": resnm,
+        "coords": coords,
+    }
+
+
+def _structure_from_mmcif_py(path: str):
+    """纯 python 兜底：引擎 from_mmcif 需要完整 RCSB 头（_entity/_struct_asym 等 category），
+    而自产的 soup 亲本 mmCIF 只有 _atom_site loop → 引擎能解析但读到 0 残基。
+    兜底按 _atom_site 列名取 ATOM 行 → from_atoms（与 verify notebook 的
+    protein_structure_from_mmcif 同套路，能读自产 12/22 列与过滤后的蛋白 mmCIF）。"""
+    names, elems, resseq, resnm, coords = _parse_mmcif_atoms(path)
+    return structure_from_atoms(names, elems, resseq, resnm, coords)
+
+
 def structure_from_mmcif(path: str):
     se = _engine()
-    return se.Structure.from_mmcif(path)
+    try:
+        struct = se.Structure.from_mmcif(path)
+        # 引擎解析成功且读到残基 → 直接用（完整 RCSB 文件）
+        if struct.residue_count() > 0:
+            return struct
+        # 0 残基（自产 soup 亲本：只有 _atom_site loop，引擎缺头信息）→ 兜底
+        logger.info(f"[structure] engine from_mmcif 读到 0 残基，走纯 python 解析: {path}")
+    except Exception as e:  # noqa: BLE001
+        logger.info(f"[structure] engine from_mmcif 失败({type(e).__name__}: {e})，走纯 python 解析: {path}")
+    return _structure_from_mmcif_py(path)
 
 
 def structure_from_atoms(

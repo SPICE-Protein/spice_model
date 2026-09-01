@@ -49,6 +49,7 @@ es:
   n_mutations_per_candidate:
   - 1
   - 3
+  mutation_alphabet: full20      # full20=全20；改 GAVDESPTRK=前生物字母表内演化（对照）
   population: 8
   q_gate: 0.5
 

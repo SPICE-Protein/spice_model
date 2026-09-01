@@ -1290,9 +1290,12 @@ def main() -> int:
         train(cfg, struct, seq, base_atoms=base_atoms,
               tag=(args.tag or args.pdb_id.lower()))
     elif args.structure:
-        from spice_rl.env import structure_from_mmcif
+        from spice_rl.env import base_atoms_from_mmcif, structure_from_mmcif
 
         struct = structure_from_mmcif(args.structure)
+        # mmCIF 入口此前不传 base_atoms → path B（ES 突变搜索）被 `base_atoms is not None`
+        # 整个跳过（0 突变 0 伪标签）。从源文件重解析构造 base_atoms（引擎 Structure 不暴露原子数组）。
+        base_atoms = base_atoms_from_mmcif(args.structure)
         if struct.residue_count() > cfg.post.max_seq_len:
             raise SystemExit(
                 f"Structure is too long: {struct.residue_count()} aa > max_seq_len="
@@ -1300,7 +1303,9 @@ def main() -> int:
             )
         seq = struct.sequence()
         logger.info(f"(Debugging) Loaded mmCIF starting structure: {seq[:30]}... n_res={struct.residue_count()}")
-        train(cfg, struct, seq)
+        # tag 缺省=文件 stem（此前结构入口不传 tag → 伪标签/候选全撞名）
+        train(cfg, struct, seq, base_atoms=base_atoms,
+              tag=(args.tag or os.path.splitext(os.path.basename(args.structure))[0]))
     else:
         raise SystemExit(
             "Execution requires either --parquet-dir + --pdb-id (data pipeline entry) or --structure (debugging mmCIF entry)"

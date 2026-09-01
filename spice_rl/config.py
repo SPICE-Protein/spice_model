@@ -115,7 +115,8 @@ class ESConfig:
     conservation_mask: bool = True         
     conservation_threshold: float = 0.80   
     conservation_external: str = ""        
-    q_gate: float = 0.50                   
+    q_gate: float = 0.50
+    mutation_alphabet: str = "full20"   # "full20"=全 20 aa；显式字符串（如 "GAVDESPTRK"）→ 突变只许引入这些 aa（前生物对照）                   
 
 
 @dataclass

@@ -139,21 +139,31 @@ def _run_task(task):
     return _run_one(*task)
 
 
+_MMCIF_COLS = [
+    "_atom_site.group_PDB", "_atom_site.id", "_atom_site.type_symbol",
+    "_atom_site.label_atom_id", "_atom_site.label_alt_id", "_atom_site.label_comp_id",
+    "_atom_site.label_asym_id", "_atom_site.label_entity_id", "_atom_site.label_seq_id",
+    "_atom_site.pdbx_PDB_ins_code", "_atom_site.Cartn_x", "_atom_site.Cartn_y",
+    "_atom_site.Cartn_z", "_atom_site.occupancy", "_atom_site.B_iso_or_equiv",
+    "_atom_site.pdbx_formal_charge", "_atom_site.auth_seq_id", "_atom_site.auth_comp_id",
+    "_atom_site.auth_asym_id", "_atom_site.auth_atom_id", "_atom_site.pdbx_PDB_model_num",
+    "_atom_site.calc_flag",
+]
+
+
 def _write_mmcif(path, names, elems, seqs, resnames, coords):
-    """最小 mmCIF writer（_atom_site loop），供 train_post --structure 当亲本加载。"""
-    cols = ["_atom_site.group_PDB", "_atom_site.id", "_atom_site.type_symbol",
-            "_atom_site.label_atom_id", "_atom_site.label_comp_id",
-            "_atom_site.label_asym_id", "_atom_site.label_seq_id",
-            "_atom_site.Cartn_x", "_atom_site.Cartn_y", "_atom_site.Cartn_z",
-            "_atom_site.occupancy", "_atom_site.B_iso_or_equiv"]
+    """mmCIF writer（_atom_site loop，22 列对齐 RCSB 头），供 train_post --structure 当亲本加载。
+    注：引擎 from_mmcif 需要完整 RCSB 头 category，仅 _atom_site loop 会读到 0 残基——
+    structure_from_mmcif 已加纯 python 兜底（按列名取 ATOM → from_atoms），故本文件可正常加载。"""
     with open(path, "w") as f:
         f.write("data_soup\n#\nloop_\n")
-        for c in cols:
+        for c in _MMCIF_COLS:
             f.write(c + "\n")
-        f.write("#\n")
         for i, (nm, el, rs, rn, xyz) in enumerate(zip(names, elems, seqs, resnames, coords)):
-            f.write(f"ATOM  {i+1:5d} {el:>2s} {nm:<4s} {rn:>3s} A {int(rs):4d} "
-                    f"{float(xyz[0]):8.3f} {float(xyz[1]):8.3f} {float(xyz[2]):8.3f}  1.00  0.00\n")
+            f.write(f"ATOM  {i+1:5d} {el:>2s} {nm:<4s} . {rn:>3s} A 1 {int(rs):4d} ? "
+                    f"{float(xyz[0]):8.3f} {float(xyz[1]):8.3f} {float(xyz[2]):8.3f}  1.00  0.00 ? "
+                    f"{int(rs):4d} {rn:>3s} A {nm:<4s} 1 ?\n")
+        f.write("#\n")
 
 
 def main() -> int:

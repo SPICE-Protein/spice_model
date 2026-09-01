@@ -13,6 +13,7 @@ from spice_rl.env.phase_map import (
 )
 from spice_rl.env.quick_check import quick_check, quick_check_env
 from spice_rl.env.structure import (
+    base_atoms_from_mmcif,
     load_structure_with_atoms,
     structure_from_atoms,
     structure_from_dataframe,
@@ -30,6 +31,7 @@ __all__ = [
     "save_phase_map",
     "load_phase_map",
     "load_structure_with_atoms",
+    "base_atoms_from_mmcif",
     "structure_from_atoms",
     "structure_from_dataframe",
     "structure_from_mmcif",
